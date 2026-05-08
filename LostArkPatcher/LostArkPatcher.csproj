@@ -1,0 +1,59 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <ApplicationIcon>Resources\LA.ico</ApplicationIcon>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+    <Version>1.1</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="DBContext\**" />
+    <EmbeddedResource Remove="DBContext\**" />
+    <None Remove="DBContext\**" />
+    <Page Remove="DBContext\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove=".Trash.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="DB.cs~RF14d41d7.TMP" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Resources\LA.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include=".Trash.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Ecng.Lzma" Version="1.0.65" />
+    <PackageReference Include="System.Data.SQLite.Core" Version="1.0.119" />
+    <PackageReference Include="System.Management" Version="10.0.7" />
+    <PackageReference Include="VCDiff" Version="5.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Update="Properties\Settings.Designer.cs">
+      <DesignTimeSharedInput>True</DesignTimeSharedInput>
+      <AutoGen>True</AutoGen>
+      <DependentUpon>Settings.settings</DependentUpon>
+    </Compile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Properties\Settings.settings">
+      <Generator>SettingsSingleFileGenerator</Generator>
+      <LastGenOutput>Settings.Designer.cs</LastGenOutput>
+    </None>
+  </ItemGroup>
+
+</Project>
