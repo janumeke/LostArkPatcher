@@ -13,7 +13,6 @@ namespace LostArkPatcher
         public MainWindow()
         {
             InitializeComponent();
-            Title += " v1.0";
             Controllers.InitializeOnMainWindowLoad(this);
             Controllers.SaveSettingsOnMainWindowClose(this);
         }

@@ -466,24 +466,23 @@ namespace LostArkPatcher
                                     {
                                         dbCommand_after.Parameters.AddWithValue("@id", id);
                                         dbCommand_after.Parameters.AddWithValue("@version", afterVersion);
-                                        DbDataReader reader_after = await dbCommand_after.ExecuteReaderAsync().ConfigureAwait(false);
-                                        using (reader_after)
-                                            if (!await reader_after.ReadAsync().ConfigureAwait(false))
-                                                ++failed;
-                                            else
-                                            {
-                                                dbCommand_update.Parameters.AddWithValue("@unique_path", unique_path);
-                                                dbCommand_update.Parameters.AddWithValue("@version", afterVersion);
-                                                dbCommand_update.Parameters.AddWithValue("@size", Convert.ToInt32(reader_after["size"]));
-                                                dbCommand_update.Parameters.AddWithValue("@hash", Convert.ToString(reader_after["hash"]));
-                                                dbCommand_update.Parameters.AddWithValue("@property", property);
-                                                await dbCommand_update.ExecuteNonQueryAsync().ConfigureAwait(false);
+                                        using DbDataReader reader_after = await dbCommand_after.ExecuteReaderAsync().ConfigureAwait(false);
+                                        if (!await reader_after.ReadAsync().ConfigureAwait(false))
+                                            ++failed;
+                                        else
+                                        {
+                                            dbCommand_update.Parameters.AddWithValue("@unique_path", unique_path);
+                                            dbCommand_update.Parameters.AddWithValue("@version", afterVersion);
+                                            dbCommand_update.Parameters.AddWithValue("@size", Convert.ToInt32(reader_after["size"]));
+                                            dbCommand_update.Parameters.AddWithValue("@hash", Convert.ToString(reader_after["hash"]));
+                                            dbCommand_update.Parameters.AddWithValue("@property", property);
+                                            await dbCommand_update.ExecuteNonQueryAsync().ConfigureAwait(false);
 
-                                                if (afterVersion == sequence.Last().toVersion)
-                                                    ++updated;
-                                                else
-                                                    ++failed;
-                                            }
+                                            if (afterVersion == sequence.Last().toVersion)
+                                                ++updated;
+                                            else
+                                                ++failed;
+                                        }
                                     }
                                 }
                                 finally
@@ -519,16 +518,13 @@ namespace LostArkPatcher
 
         /// <param name="FileExists">in: relative path, case-insensitive (ok for windows system)</param>
         /// <exception cref="InvalidOperationException"/>
-        //Entries not in  server DB or with missing files will be deleted, but entries with corrupted files will be unchanged
-        public async Task<(int deleted, int inserted)> FixFileKeysAsync(Func<string, bool> FileExists, CancellationToken cancelToken, IProgress<float>? progress = null)
+        //Entries in local DB but in server DB will be deleted and those in server DB but in local DB will be inserted; entries with missing or corrupted files will be unchanged
+        public async Task<(int deleted, int inserted)> FixFileKeysAsync()
         {
             if (fileInfo is null)
                 throw new InvalidOperationException("Server DB is not attched.");
 
             int deleted = 0, inserted = 0;
-            PeriodicProgressReporter? progressReporter = null;
-            if (progress is not null)
-                progressReporter = new(0.5, progress);
             SQLiteCommand dbCommand = dbConnection.CreateCommand();
             await using (dbCommand.ConfigureAwait(false))
             {
@@ -554,57 +550,7 @@ namespace LostArkPatcher
                     file_version.name
                 );
                 inserted += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-
-                progressReporter?.SetStageTarget(0.1f, 0.9f);
-                await pending_changes.DeleteAsync().ConfigureAwait(false);
-                string sqlAllPaths = SQL.Row.Select(
-                    file_version.name,
-                    null,
-                    "unique_path"
-                );
-                dbCommand.CommandText = SQL.Row.CountQuery(sqlAllPaths);
-                int totalCount = Convert.ToInt32(await dbCommand.ExecuteScalarAsync().ConfigureAwait(false));
-                int doneCount = 0;
-                dbCommand.CommandText = sqlAllPaths;
-                DbDataReader reader = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
-                await using (reader.ConfigureAwait(false))
-                {
-                    SQLiteCommand dbCommand_update = new(
-                        SQL.Row.Replace(
-                            pending_changes.name,
-                            "unique_path",
-                            "@unique_path"
-                        ),
-                        dbConnection
-                    );
-                    await using (dbCommand_update.ConfigureAwait(false))
-                        foreach (IDataRecord row in reader)
-                        {
-                            if (cancelToken.IsCancellationRequested)
-                                break;
-
-                            string unique_path = Convert.ToString(row["unique_path"]);
-                            if (!FileExists(unique_path))
-                            {
-                                dbCommand_update.Parameters.AddWithValue("@unique_path", unique_path);
-                                await dbCommand_update.ExecuteNonQueryAsync().ConfigureAwait(false);
-                            }
-                            progressReporter?.SetStageRatio((float)++doneCount / totalCount);
-                        }
-                }
-                dbCommand.CommandText = SQL.Row.DeleteInQuery(
-                    file_version.name,
-                    "unique_path",
-                    SQL.Row.Select(
-                        pending_changes.name,
-                        null,
-                        "unique_path"
-                    )
-                );
-                deleted = await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                await pending_changes.DeleteAsync().ConfigureAwait(false);
             }
-            progressReporter?.Dispose();
             return (deleted, inserted);
         }
 
@@ -622,6 +568,7 @@ namespace LostArkPatcher
         /// </param>
         /// <exception cref="InvalidOperationException"/>
         //Use actual size, version and hash of entry if possible, and actual hash if necessary to best guess which entry in the server db the file is
+        //Entries with missing or unknown files will be deleted
         public async Task<(int deleted, int modified)> FixFileInfosAsync(Func<string, long> GetFileSize, Func<string, CancellationToken, Task<string?>> HashFileAsync, CancellationToken cancelToken, IProgress<float>? progress = null, bool noGuessing = false)
         {
             if (fileInfo is null)
@@ -697,10 +644,14 @@ namespace LostArkPatcher
                     )
                 );
                 await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                progressReporter?.SetStageTarget(0.05f, 0.05f);
+                //Delete entries with missing files
+                await file_version.DeleteAsync("size is null").ConfigureAwait(false);
 
                 if (noGuessing)
                 {
+                    progressReporter?.SetStageTarget(0.05f, 0.05f);
+                    await pending_changes.DeleteAsync().ConfigureAwait(false);
+
                     //Delete entries that don't match any size in server db
                     string sqlServerHasNoSize = SQL.Row.LeftJoin(
                         file_version.name,
@@ -745,6 +696,7 @@ namespace LostArkPatcher
                     hash matched in server db: fill in the version
                     no such hash in server db: delete entry
                     */
+                    progressReporter?.SetStageTarget(0.05f, 0.01f);
                     await pending_changes.DeleteAsync().ConfigureAwait(false);
 
                     string sqlServerHasVersion = SQL.Row.Join(

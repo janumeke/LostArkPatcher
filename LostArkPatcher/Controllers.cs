@@ -168,7 +168,7 @@ namespace LostArkPatcher
          *  update steps: <= 2
          *  download threads: 8 when not decoding
          *  decompress threads: (cores - 1) when not decoding
-         *  decode threads: 1 when not any
+         *  decode threads: 1
          * SSD:
          *  update steps: unlimited
          *  download threads: 8
@@ -184,11 +184,9 @@ namespace LostArkPatcher
 
         private static FS.DiskType diskType;
 
-        private static readonly AutoResetEvent notDownloading = new(true), notDecompressing = new(true), notDecoding = new(true);
-
-        private static int downloadingThreads = 0, decompressingThreads = 0;
-
         private static Semaphore? maxDownloadingThreads = null, maxDecompressingThreads = null;
+
+        private static readonly AutoResetEvent notDecoding = new(true);
 
         private static void SetUpdatingLimitations()
         {
@@ -230,7 +228,7 @@ namespace LostArkPatcher
         /// out: the version in the end, or null if unchanged
         private static async Task<int?> UpdateFileAsync(DB.FileUpdateInfo info, CancellationToken cancelToken)
         {
-            if (maxDownloadedSize <= 0 || maxDecompressedCount <= 0 || maxDownloadingThreads is null || maxDecompressingThreads is null)
+            if (maxDownloadingThreads is null || maxDecompressingThreads is null)
                 throw new InvalidOperationException("Limitations of updating is not set.");
 
             //Locks are acquired in this order: downloadedNotFull, decompressedNotFull, maxDownloadingTasks, notDownloading, maxDecompressingTasks, notDecompressing, notDecoding
@@ -243,8 +241,6 @@ namespace LostArkPatcher
                 {
                     downloadedNotFull.WaitOne();
                     maxDownloadingThreads.WaitOne();
-                    Interlocked.Increment(ref downloadingThreads);
-                    notDownloading.Reset();
                     notDecoding.WaitOne();
                     notDecoding.Set();
                 }
@@ -252,8 +248,6 @@ namespace LostArkPatcher
                 {
                     downloadedNotFull.WaitOne();
                     maxDownloadingThreads.WaitOne();
-                    Interlocked.Increment(ref downloadingThreads);
-                    notDownloading.Reset();
                 }
                 return await Task.Run<int?>(async () => {
                     string? path;
@@ -262,8 +256,6 @@ namespace LostArkPatcher
                         path = Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar + path;
                     else
                         path = await FS.DownloadGameFileAsync(info.id, info.sequence.Last().toVersion, null, Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar, cancelToken);
-                    if (Interlocked.Decrement(ref downloadingThreads) == 0)
-                        notDownloading.Set();
                     maxDownloadingThreads.Release();
                     if (path is null)
                         return null;
@@ -275,8 +267,6 @@ namespace LostArkPatcher
                     {
                         decompressedNotFull.WaitOne();
                         maxDecompressingThreads.WaitOne();
-                        Interlocked.Increment(ref decompressingThreads);
-                        notDecompressing.Reset();
                         notDecoding.WaitOne();
                         notDecoding.Set();
                     }
@@ -284,8 +274,6 @@ namespace LostArkPatcher
                     {
                         decompressedNotFull.WaitOne();
                         maxDecompressingThreads.WaitOne();
-                        Interlocked.Increment(ref decompressingThreads);
-                        notDecompressing.Reset();
                     }
                     if (cancelToken.IsCancellationRequested)
                     {
@@ -296,8 +284,6 @@ namespace LostArkPatcher
                         path = FS.DecompressIfNecessary(path);
                     if (Interlocked.Add(ref maxDownloadedSize, size) > 0)
                         downloadedNotFull.Set();
-                    if (Interlocked.Decrement(ref decompressingThreads) == 0)
-                        notDecompressing.Set();
                     maxDecompressingThreads.Release();
                     if (path is null)
                         return null;
@@ -324,8 +310,6 @@ namespace LostArkPatcher
                     {
                         downloadedNotFull.WaitOne();
                         maxDownloadingThreads.WaitOne();
-                        Interlocked.Increment(ref downloadingThreads);
-                        notDownloading.Reset();
                         notDecoding.WaitOne();
                         notDecoding.Set();
                     }
@@ -333,8 +317,6 @@ namespace LostArkPatcher
                     {
                         downloadedNotFull.WaitOne();
                         maxDownloadingThreads.WaitOne();
-                        Interlocked.Increment(ref downloadingThreads);
-                        notDownloading.Reset();
                     }
                     Task<int?>? preVersionTask = lastVersionTask;
                     lastVersionTask = Task.Run<int?>(async () => {
@@ -344,8 +326,6 @@ namespace LostArkPatcher
                             path = Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar + path;
                         else
                             path = await FS.DownloadGameFileAsync(info.id, delta.toVersion, delta.fromVersion, Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar, cancelToken);
-                        if (Interlocked.Decrement(ref downloadingThreads) == 0)
-                            notDownloading.Set();
                         maxDownloadingThreads.Release();
                         if (path is null)
                             if (preVersionTask is not null)
@@ -360,8 +340,6 @@ namespace LostArkPatcher
                         {
                             decompressedNotFull.WaitOne();
                             maxDecompressingThreads.WaitOne();
-                            Interlocked.Increment(ref decompressingThreads);
-                            notDecompressing.Reset();
                             notDecoding.WaitOne();
                             notDecoding.Set();
                         }
@@ -369,8 +347,6 @@ namespace LostArkPatcher
                         {
                             decompressedNotFull.WaitOne();
                             maxDecompressingThreads.WaitOne();
-                            Interlocked.Increment(ref decompressingThreads);
-                            notDecompressing.Reset();
                         }
                         if (cancelToken.IsCancellationRequested)
                         {
@@ -381,8 +357,6 @@ namespace LostArkPatcher
                             path = FS.DecompressIfNecessary(path);
                         if (Interlocked.Add(ref maxDownloadedSize, size) > 0)
                             downloadedNotFull.Set();
-                        if (Interlocked.Decrement(ref decompressingThreads) == 0)
-                            notDecompressing.Set();
                         maxDecompressingThreads.Release();
                         if (path is null)
                             if (preVersionTask is not null)
@@ -398,18 +372,7 @@ namespace LostArkPatcher
                             if (preVersion is null || preVersion != delta.fromVersion) //one of the previous tasks failed and this delta cannot decode
                                 return preVersion;
                         }
-                        if(diskType == FS.DiskType.HDD)
-                        {
-                            notDownloading.WaitOne();
-                            notDecompressing.WaitOne();
-                            notDecoding.WaitOne();
-                            notDownloading.Set();
-                            notDecompressing.Set();
-                        }
-                        else
-                        {
-                            notDecoding.WaitOne();
-                        }
+                        notDecoding.WaitOne();
                         bool decoding;
                         if (cancelToken.IsCancellationRequested)
                         {
@@ -721,13 +684,10 @@ namespace LostArkPatcher
                                 return;
 
                             int deleted, inserted, modified;
-                            lastLine = new Model.Log.LogLineProgress("├檢查項目");
+
+                            lastLine = new Model.Log.LogLinePending("├檢查項目");
                             Application.Current.Dispatcher.Invoke(() => { Model.log.AddLine(lastLine); });
-                            (deleted, inserted) = await db.FixFileKeysAsync((relativePath) => {
-                                return File.Exists(Model.gameDirectory + relativePath);
-                            }, Model.cancellationTokenSource.Token, new Progress<float>((ratio) => {
-                                Application.Current.Dispatcher.Invoke(() => { ((Model.Log.LogLineProgress)lastLine).Percent = ratio * 100; });
-                            }));
+                            (deleted, inserted) = await db.FixFileKeysAsync();
                             Application.Current.Dispatcher.Invoke(() => {
                                 if (Model.cancellationTokenSource.IsCancellationRequested)
                                     lastLine.Status = Model.Log.LogLineState.Interrupted;
