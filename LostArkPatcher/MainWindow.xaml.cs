@@ -1,7 +1,4 @@
-﻿using Microsoft.Win32;
-using System.Windows;
-using System.IO;
-using System.Diagnostics;
+﻿using System.Windows;
 
 namespace LostArkPatcher
 {

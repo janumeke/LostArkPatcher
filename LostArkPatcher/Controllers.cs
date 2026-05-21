@@ -225,7 +225,7 @@ namespace LostArkPatcher
                 catch { }
         }
 
-        /// out: the version in the end, or null if unchanged
+        // out: the version in the end, or null if unchanged
         private static async Task<int?> UpdateFileAsync(DB.FileUpdateInfo info, CancellationToken cancelToken)
         {
             if (maxDownloadingThreads is null || maxDecompressingThreads is null)
@@ -255,7 +255,7 @@ namespace LostArkPatcher
                         && File.Exists(Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar + path))
                         path = Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar + path;
                     else
-                        path = await FS.DownloadGameFileAsync(info.id, info.sequence.Last().toVersion, null, Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar, cancelToken);
+                        path = await FS.DownloadGameFileAsync(info.id, info.sequence.Last().toVersion, null, Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar, cancelToken).ConfigureAwait(false);
                     maxDownloadingThreads.Release();
                     if (path is null)
                         return null;
@@ -291,14 +291,14 @@ namespace LostArkPatcher
                         decompressedNotFull.Reset();
                     //Decode
                     //only moving file to the same partition and not locking
-                    bool decode = await FS.DecodeAsync(path, Model.gameDirectory + info.relativePath, false);
+                    bool decode = await FS.DecodeAsync(path, Model.gameDirectory + info.relativePath, false).ConfigureAwait(false);
                     if (Interlocked.Increment(ref maxDecompressedCount) > 0)
                         decompressedNotFull.Set();
                     if (decode)
                         return info.sequence.Last().toVersion;
                     else
                         return null;
-                });
+                }).ConfigureAwait(false);
             }
             else //Deltas
             {
@@ -325,11 +325,11 @@ namespace LostArkPatcher
                             && File.Exists(Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar + path))
                             path = Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar + path;
                         else
-                            path = await FS.DownloadGameFileAsync(info.id, delta.toVersion, delta.fromVersion, Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar, cancelToken);
+                            path = await FS.DownloadGameFileAsync(info.id, delta.toVersion, delta.fromVersion, Model.gameDirectory + tempDirectory + Path.DirectorySeparatorChar, cancelToken).ConfigureAwait(false);
                         maxDownloadingThreads.Release();
                         if (path is null)
                             if (preVersionTask is not null)
-                                return await preVersionTask;
+                                return await preVersionTask.ConfigureAwait(false);
                             else
                                 return null;
                         long size = FS.GetFileSize(path);
@@ -360,7 +360,7 @@ namespace LostArkPatcher
                         maxDecompressingThreads.Release();
                         if (path is null)
                             if (preVersionTask is not null)
-                                return await preVersionTask;
+                                return await preVersionTask.ConfigureAwait(false);
                             else
                                 return null;
                         if (Interlocked.Decrement(ref maxDecompressedCount) == 0)
@@ -368,7 +368,7 @@ namespace LostArkPatcher
                         //Decode after previous version has finished decoding
                         if (preVersionTask is not null)
                         {
-                            int? preVersion = await preVersionTask;
+                            int? preVersion = await preVersionTask.ConfigureAwait(false);
                             if (preVersion is null || preVersion != delta.fromVersion) //one of the previous tasks failed and this delta cannot decode
                                 return preVersion;
                         }
@@ -380,19 +380,19 @@ namespace LostArkPatcher
                             decoding = false;
                         }
                         else
-                            decoding = await FS.DecodeAsync(path, Model.gameDirectory + info.relativePath, delta.fromVersion != null);
+                            decoding = await FS.DecodeAsync(path, Model.gameDirectory + info.relativePath, delta.fromVersion != null).ConfigureAwait(false);
                         if (Interlocked.Increment(ref maxDecompressedCount) > 0)
                             decompressedNotFull.Set();
                         notDecoding.Set();
                         if (decoding)
                             return delta.toVersion;
                         else if (preVersionTask is not null)
-                            return await preVersionTask;
+                            return await preVersionTask.ConfigureAwait(false);
                         else
                             return null;
                     });
                 }
-                return await lastVersionTask;
+                return await lastVersionTask.ConfigureAwait(false);
             }
         }
 
@@ -546,7 +546,7 @@ namespace LostArkPatcher
 
         private static Semaphore? maxHashingThreads = null;
 
-        private readonly static ConcurrentDictionary<MD5, bool> md5s = new();
+        private readonly static ConcurrentBag<MD5> md5s = new();
 
         private static void SetHashingLimitations()
         {
@@ -555,7 +555,7 @@ namespace LostArkPatcher
                 //hashing is bottlenecked by reading files and concurrent reads create delay
                 maxHashingThreads = new(1, 1);
                 while (md5s.IsEmpty)
-                    md5s.TryAdd(MD5.Create(), true);
+                    md5s.Add(MD5.Create());
             }
             else
             {
@@ -564,12 +564,12 @@ namespace LostArkPatcher
                     coresToUse = 1;
                 maxHashingThreads = new(coresToUse, coresToUse);
                 while (md5s.Count < coresToUse)
-                    md5s.TryAdd(MD5.Create(), true);
+                    md5s.Add(MD5.Create());
             }
         }
 
-        /// in: relative path, case-insensitive (ok for windows system)
-        /// out: md5 in lower-case or null if non-existent
+        // in: relative path, case-insensitive (ok for windows system)
+        // out: md5 in lower-case or null if non-existent
         private static async Task<string?> HashFileAsync(string relativePath, CancellationToken cancelToken)
         {
             if(maxHashingThreads is null)
@@ -578,17 +578,14 @@ namespace LostArkPatcher
             maxHashingThreads.WaitOne();
             try
             {
-                return await Task.Run(() => {
-                    foreach(var kvp in md5s)
-                        if(kvp.Value)
-                        {
-                            md5s[kvp.Key] = false;
-                            string? hash = FS.GetFileMD5(Model.gameDirectory + relativePath, kvp.Key);
-                            md5s[kvp.Key] = true;
-                            return hash;
-                        }
+                if (md5s.TryTake(out MD5 md5))
+                {
+                    string? hash = await Task.Run(() => FS.GetFileMD5(Model.gameDirectory + relativePath, md5)).ConfigureAwait(false);
+                    md5s.Add(md5);
+                    return hash;
+                }
+                else
                     throw new InvalidOperationException("No available MD5.");
-                });
             }
             finally
             {
@@ -791,7 +788,7 @@ namespace LostArkPatcher
                 return false;
             }
             if ((!File.Exists(Model.gameDirectory + Model.LOCALDB_FILENAME) || !File.Exists(Model.gameDirectory + Model.LAUNCHER_FILENAME))
-                && MessageBox.Show("這似乎不是遊戲資料夾。\n其中的檔案可能會被覆蓋。\n你確定要繼續?", "警告", MessageBoxButton.OKCancel) == MessageBoxResult.Cancel)
+                && MessageBox.Show("這似乎不是遊戲資料夾。\n其中的檔案可能會被覆蓋。\n你確定要繼續?", "警告", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.Cancel) == MessageBoxResult.Cancel)
                     return false;
             return true;
         }
@@ -799,7 +796,7 @@ namespace LostArkPatcher
         public static bool CheckRunningApps()
         {
             if ((Process.GetProcessesByName("Launcher").Length > 0 || Process.GetProcessesByName("LOSTARK").Length > 0)
-                && MessageBox.Show("啟動器或遊戲似乎正在運行。\n此時操作可能會產生問題。\n你確定要繼續?", "警告", MessageBoxButton.OKCancel) == MessageBoxResult.Cancel)
+                && MessageBox.Show("啟動器或遊戲似乎正在運行。\n此時操作可能會產生問題。\n你確定要繼續?", "警告", MessageBoxButton.OKCancel, MessageBoxImage.Warning, MessageBoxResult.Cancel) == MessageBoxResult.Cancel)
                     return false;
             return true;
         }

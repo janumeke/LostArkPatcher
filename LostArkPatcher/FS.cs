@@ -471,11 +471,11 @@ namespace LostArkPatcher
         /// CPU-intensive.
         /// </remarks>
         /// <param name="decoder">If it's <c>null</c>, the internal decoder which can be used by one thread only is used.</param>
-        private static void DecompressLZMA(string inPath, string outPath)
+        private static async Task DecompressLZMA(string inPath, string outPath)
         {
-            using FileStream iFS = File.Open(inPath, FileMode.Open);
-            using LzmaStream lzmaStream = new(iFS, CompressionMode.Decompress, leaveOpen: false);
-            using FileStream oFS = File.Open(outPath, FileMode.Create);
+            await using FileStream iFS = File.Open(inPath, FileMode.Open);
+            await using LzmaStream lzmaStream = new(iFS, CompressionMode.Decompress, leaveOpen: false);
+            await using FileStream oFS = File.Open(outPath, FileMode.Create);
             lzmaStream.CopyTo(oFS);
         }
 

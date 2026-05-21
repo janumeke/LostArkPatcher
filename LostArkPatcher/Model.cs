@@ -1,15 +1,12 @@
-﻿using System.Diagnostics;
-using System.IO;
-using System.Windows.Documents;
-using static System.Net.Mime.MediaTypeNames;
+﻿using System.IO;
 
 namespace LostArkPatcher
 {
     internal static class Model
     {
         private static string _gameDirectory = String.Empty;
-        /// <value>Always ends with a directory seprartor.</value>
         public static event EventHandler<string>? GameDirectoryChanged;
+        /// <value>Always ends with a directory seprartor.</value>
         public static string gameDirectory
         {
             get

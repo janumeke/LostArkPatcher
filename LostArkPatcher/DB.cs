@@ -1,17 +1,7 @@
-﻿using Microsoft.VisualBasic;
-using System.Data;
+﻿using System.Data;
 using System.Data.Common;
 using System.Data.SQLite;
-using System.Drawing;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Security.Policy;
 using System.Text.RegularExpressions;
-using System.Windows;
-using System.Windows.Input;
-using static System.Net.Mime.MediaTypeNames;
-using static System.Net.WebRequestMethods;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace LostArkPatcher
 {
@@ -330,6 +320,7 @@ namespace LostArkPatcher
 
         /// <param name="UpdateFileAsync">
         /// <para>out: the version in the end, or <c>null</c> if unchanged</para>
+        /// <remarks>Block the calling thread to stop the next file updating.</remarks>
         /// </param>
         /// <exception cref="InvalidOperationException"/>
         //Missing or corrupted files for entries will fail, but missing entries will be updated
@@ -348,6 +339,7 @@ namespace LostArkPatcher
                 progressReporter?.SetStageTarget(0f, 1f);
                 await pending_changes.DeleteAsync().ConfigureAwait(false);
                 uint updatingCount = 0;
+                ConcurrentExclusiveSchedulerPair schedulerPair = new(TaskScheduler.Default);
 
                 SQLiteCommand dbCommand_delta = new(
                     SQL.Row.Select(
@@ -442,10 +434,10 @@ namespace LostArkPatcher
 
                         //Update
                         if (sequence.Count == 0)
-                            ++failed;
+                            Interlocked.Increment(ref failed);
                         else
                         {
-                            ++updatingCount;
+                            Interlocked.Increment(ref updatingCount);
 #pragma warning disable CS4014
                             UpdateFileAsync(
                                 new()
@@ -461,14 +453,14 @@ namespace LostArkPatcher
                                 {
                                     int? afterVersion = preTask.Result;
                                     if (afterVersion is null)
-                                        ++failed;
+                                        Interlocked.Increment(ref failed);
                                     else
                                     {
                                         dbCommand_after.Parameters.AddWithValue("@id", id);
                                         dbCommand_after.Parameters.AddWithValue("@version", afterVersion);
                                         using DbDataReader reader_after = await dbCommand_after.ExecuteReaderAsync().ConfigureAwait(false);
                                         if (!await reader_after.ReadAsync().ConfigureAwait(false))
-                                            ++failed;
+                                            Interlocked.Increment(ref failed);
                                         else
                                         {
                                             dbCommand_update.Parameters.AddWithValue("@unique_path", unique_path);
@@ -479,18 +471,18 @@ namespace LostArkPatcher
                                             await dbCommand_update.ExecuteNonQueryAsync().ConfigureAwait(false);
 
                                             if (afterVersion == sequence.Last().toVersion)
-                                                ++updated;
+                                                Interlocked.Increment(ref updated);
                                             else
-                                                ++failed;
+                                                Interlocked.Increment(ref failed);
                                         }
                                     }
                                 }
                                 finally
                                 {
-                                    progressReporter?.SetStageRatio((float)++doneCount / totalCount);
-                                    --updatingCount;
+                                    progressReporter?.SetStageRatio((float)Interlocked.Increment(ref doneCount) / totalCount);
+                                    Interlocked.Decrement(ref updatingCount);
                                 }
-                            }, TaskContinuationOptions.ExecuteSynchronously);
+                            }, schedulerPair.ExclusiveScheduler);
 #pragma warning restore CS4014
                         }
                     }
@@ -561,6 +553,7 @@ namespace LostArkPatcher
         /// <param name="HashFileAsync">
         /// <para>in: relative path, case-insensitive (ok for windows system)</para>
         /// <para>out: md5 in lower-case or <c>null</c> if non-existent</para>
+        /// <remarks>Block the calling thread to stop the next file updating.</remarks>
         /// </param>
         /// <param name="noGuessing">
         /// <para>true: Hash every file whose size is at least in one entry in the server database.</para>
@@ -920,8 +913,8 @@ namespace LostArkPatcher
                 }
 
                 //Calculate the file hash:
-                ManualResetEvent next = new(true);
                 uint hashingCount = 0;
+                ConcurrentExclusiveSchedulerPair schedulerPair = new(TaskScheduler.Default);
                 SQLiteCommand dbCommand_hash = new(
                     SQL.Row.Replace(
                         pending_changes.name,
@@ -948,7 +941,7 @@ namespace LostArkPatcher
                             break;
 
                         string unique_path = Convert.ToString(row["unique_path"]);
-                        ++hashingCount;
+                        Interlocked.Increment(ref hashingCount);
 #pragma warning disable CS4014
                         HashFileAsync(unique_path, cancelToken)
                         .ContinueWith(async (preTask) => {
@@ -964,10 +957,10 @@ namespace LostArkPatcher
                             }
                             finally
                             {
-                                progressReporter?.SetStageRatio((float)++doneCount / totalCount);
-                                --hashingCount;
+                                progressReporter?.SetStageRatio((float)Interlocked.Increment(ref doneCount) / totalCount);
+                                Interlocked.Decrement(ref hashingCount);
                             }
-                        }, TaskContinuationOptions.ExecuteSynchronously);
+                        }, schedulerPair.ExclusiveScheduler);
 #pragma warning restore CS4014
                     }
 
