@@ -281,7 +281,7 @@ namespace LostArkPatcher
                         path = null;
                     }
                     else
-                        path = FS.DecompressIfNecessary(path);
+                        path = await FS.DecompressIfNecessaryAsync(path);
                     if (Interlocked.Add(ref maxDownloadedSize, size) > 0)
                         downloadedNotFull.Set();
                     maxDecompressingThreads.Release();
@@ -354,7 +354,7 @@ namespace LostArkPatcher
                             path = null;
                         }
                         else
-                            path = FS.DecompressIfNecessary(path);
+                            path = await FS.DecompressIfNecessaryAsync(path);
                         if (Interlocked.Add(ref maxDownloadedSize, size) > 0)
                             downloadedNotFull.Set();
                         maxDecompressingThreads.Release();

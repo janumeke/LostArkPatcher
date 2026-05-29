@@ -143,7 +143,7 @@ namespace LostArkPatcher
             installerPath = await DownloadAsync(installerUrl, toDir, cancellationToken).ConfigureAwait(false);
             if (installerPath == null)
                 return false;
-            installerPath = DecompressIfNecessary(installerPath);
+            installerPath = await DecompressIfNecessaryAsync(installerPath);
             if (installerPath is null)
                 return false;
 
@@ -188,7 +188,7 @@ namespace LostArkPatcher
             string? path = await DownloadAsync(archiveUrl, toDir, cancellationToken).ConfigureAwait(false);
             if(path is null)
                 return null;
-            return DecompressIfNecessary(path);
+            return await DecompressIfNecessaryAsync(path);
         }
 
         /// <remarks>
@@ -208,13 +208,13 @@ namespace LostArkPatcher
         }
 
         /// <remarks>
-        /// It will be saved to the same directory. The original file will be deleted.
+        /// It will be saved to the same directory. The original compressed file will be deleted.
         /// Thread-safe.
         /// CPU-intensive.
         /// </remarks>
         /// <param name="lzmaDecoder">If it's <c>null</c>, the internal decoder which can be used by one thread only is used.</param>
         /// <returns>File location or <c>null</c> if it failed.</returns>
-        public static string? DecompressIfNecessary(string path)
+        public static async Task<string?> DecompressIfNecessaryAsync(string path)
         {
             if (Path.GetExtension(path) == ".cab")
             {
@@ -223,7 +223,7 @@ namespace LostArkPatcher
                 string fileName = Path.GetFileNameWithoutExtension(cabName);
                 try
                 {
-                    DecompressLZMA(dir + cabName, dir + fileName);
+                    await DecompressLZMAAsync(dir + cabName, dir + fileName);
                     return dir + fileName;
                 }
                 catch
@@ -252,12 +252,11 @@ namespace LostArkPatcher
             if (isDelta)
             {
                 bool result = await ApplyDeltaAsync(toPath, fromPath).ConfigureAwait(false);
-                if (result)
-                    try
-                    {
-                        File.Delete(fromPath);
-                    }
-                    catch { }
+                try
+                {
+                    File.Delete(fromPath);
+                }
+                catch { }
                 return result;
             }
             else
@@ -413,12 +412,6 @@ namespace LostArkPatcher
                 using FileStream fs = File.Open(path, FileMode.Open);
                 xmlSerializer ??= new(typeof(List<GameFileEntry>));
                 return (List<GameFileEntry>?)xmlSerializer.Deserialize(fs);
-                /*if (list is null)
-                    return null;
-                Dictionary<(int id, int? fromVersion, int toVersion), string> dict = new();
-                foreach (GameFileEntry entry in list)
-                    dict.Add((entry.Id, entry.FromVersion, entry.ToVersion), entry.Path);
-                return dict;*/
             }
             catch
             {
@@ -471,12 +464,12 @@ namespace LostArkPatcher
         /// CPU-intensive.
         /// </remarks>
         /// <param name="decoder">If it's <c>null</c>, the internal decoder which can be used by one thread only is used.</param>
-        private static async Task DecompressLZMA(string inPath, string outPath)
+        private static async Task DecompressLZMAAsync(string inPath, string outPath)
         {
             await using FileStream iFS = File.Open(inPath, FileMode.Open);
             await using LzmaStream lzmaStream = new(iFS, CompressionMode.Decompress, leaveOpen: false);
             await using FileStream oFS = File.Open(outPath, FileMode.Create);
-            lzmaStream.CopyTo(oFS);
+            await lzmaStream.CopyToAsync(oFS);
         }
 
         /// <remarks>

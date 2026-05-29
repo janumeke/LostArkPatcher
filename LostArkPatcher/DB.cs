@@ -609,8 +609,6 @@ namespace LostArkPatcher
                         int? size = _size == DBNull.Value ? null : Convert.ToInt32(_size);
 
                         long diskSize = GetFileSize(unique_path);
-                        if (diskSize < 0)
-                            continue;
                         if (size != diskSize)
                         {
                             dbCommand_size.Parameters.AddWithValue("@unique_path", unique_path);
