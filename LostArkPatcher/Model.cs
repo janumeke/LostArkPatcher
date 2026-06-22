@@ -1,336 +1,386 @@
-﻿using System.IO;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.IO;
+using System.Security.Cryptography;
 
 namespace LostArkPatcher
 {
     internal static class Model
     {
-        private static string _gameDirectory = String.Empty;
-        public static event EventHandler<string>? GameDirectoryChanged;
-        /// <value>Always ends with a directory seprartor.</value>
-        public static string gameDirectory
+        //Should be set before preparations for updating or repairing
+        private static string gamePath;
+        private static FS.DiskType diskType;
+
+        # region Updating Game Files
+        /*  downloaded storage: <= 1 GB
+         *  decompressed storage: <= (decompress_threads + 1) files
+         * HDD:
+         *  update steps: <= 2
+         *  download threads: 8 when not decoding
+         *  decompress threads: (cores - 1) when not decoding
+         *  decode threads: 1
+         * SSD:
+         *  update steps: unlimited
+         *  download threads: 8
+         *  decompress threads: (cores - 1)
+         *  decode threads: 1
+         */
+
+        private static long maxDownloadedSize = 0;
+
+        private static int  maxDecompressedCount = 0;
+
+        private static readonly ManualResetEvent downloadedNotFull = new(true), decompressedNotFull = new(true);
+
+        private static Semaphore? maxDownloadingThreads = null, maxDecompressingThreads = null;
+
+        private static readonly AutoResetEvent notDecoding = new(true);
+
+        //Should be called before updating
+        private static void SetUpdatingLimitations()
         {
-            get
+            maxDownloadedSize = 1024 * 1024 * 1024; //1GB
+            int coresToUse = Environment.ProcessorCount - 1;
+            if (coresToUse < 1)
+                coresToUse = 1;
+            maxDecompressedCount = coresToUse + 1;
+            maxDownloadingThreads = new(8, 8);
+            maxDecompressingThreads = new(coresToUse, coresToUse);
+        }
+
+        private const string tempDirectory = ".patcher", registryFile = "dict";
+
+        private static ConcurrentDictionary<(int id, int? fromVersion, int toVersion), string>? registry;
+
+        //Should be called before updating
+        private static void LoadUpdatingCache()
+        {
+            List<GameFileEntry>? _registry = FS.LoadGameFileRegistry(gamePath + tempDirectory + Path.DirectorySeparatorChar + registryFile);
+            registry = new();
+            if (_registry is not null)
+                foreach(GameFileEntry entry in _registry)
+                    registry.TryAdd((entry.Id, entry.FromVersion, entry.ToVersion), entry.Path);
+        }
+
+        //Should be called after updating
+        private static void SaveUpdatingCache()
+        {
+            if (registry is not null && !registry.IsEmpty)
+                FS.SaveGameFileRegistry(registry, gamePath + tempDirectory + Path.DirectorySeparatorChar + registryFile);
+            else
+                try
+                {
+                    File.Delete(gamePath + tempDirectory + Path.DirectorySeparatorChar + registryFile);
+                }
+                catch { }
+        }
+
+        // out: the version in the end, or null if unchanged
+        private static async Task<int?> UpdateFileAsync(DB.FileUpdateInfo info, CancellationToken cancelToken)
+        {
+            if (maxDownloadingThreads is null || maxDecompressingThreads is null)
+                throw new InvalidOperationException("Limitations of updating is not set.");
+
+            //Locks are acquired in this order: downloadedNotFull, decompressedNotFull, maxDownloadingTasks, notDownloading, maxDecompressingTasks, notDecompressing, notDecoding
+            //Special case where there is one full file
+            if ((info.sequence.Count == 1 && info.sequence.First().fromVersion == null) //New file
+                || (diskType == FS.DiskType.HDD && info.sequence.Count > 2)) //Always use full instead of deltas
             {
-                return _gameDirectory;
-            }
-            set
-            {
-                if (value != String.Empty && !Path.EndsInDirectorySeparator(value))
-                    _gameDirectory = value + Path.DirectorySeparatorChar;
+                //Download
+                if (diskType == FS.DiskType.HDD)
+                {
+                    downloadedNotFull.WaitOne();
+                    maxDownloadingThreads.WaitOne();
+                    notDecoding.WaitOne();
+                    notDecoding.Set();
+                }
                 else
-                    _gameDirectory = value;
-                GameDirectoryChanged?.Invoke(null, _gameDirectory);
+                {
+                    downloadedNotFull.WaitOne();
+                    maxDownloadingThreads.WaitOne();
+                }
+                return await Task.Run<int?>(async () => {
+                    string? path;
+                    if (registry is not null && registry.TryRemove((info.id, null, info.sequence.Last().toVersion), out path)
+                        && File.Exists(gamePath + tempDirectory + Path.DirectorySeparatorChar + path))
+                        path = gamePath + tempDirectory + Path.DirectorySeparatorChar + path;
+                    else
+                        path = await FS.DownloadGameFileAsync(info.id, info.sequence.Last().toVersion, null, gamePath + tempDirectory + Path.DirectorySeparatorChar, cancelToken).ConfigureAwait(false);
+                    maxDownloadingThreads.Release();
+                    if (path is null)
+                        return null;
+                    long size = FS.GetFileSize(path);
+                    if (Interlocked.Add(ref maxDownloadedSize, -size) <= 0)
+                        downloadedNotFull.Reset();
+                    //Decompress
+                    if (diskType == FS.DiskType.HDD)
+                    {
+                        decompressedNotFull.WaitOne();
+                        maxDecompressingThreads.WaitOne();
+                        notDecoding.WaitOne();
+                        notDecoding.Set();
+                    }
+                    else
+                    {
+                        decompressedNotFull.WaitOne();
+                        maxDecompressingThreads.WaitOne();
+                    }
+                    if (cancelToken.IsCancellationRequested)
+                    {
+                        registry?.TryAdd((info.id, null, info.sequence.Last().toVersion), Path.GetFileName(path));
+                        path = null;
+                    }
+                    else
+                        path = await FS.DecompressIfNecessaryAsync(path);
+                    if (Interlocked.Add(ref maxDownloadedSize, size) > 0)
+                        downloadedNotFull.Set();
+                    maxDecompressingThreads.Release();
+                    if (path is null)
+                        return null;
+                    if (Interlocked.Decrement(ref maxDecompressedCount) == 0)
+                        decompressedNotFull.Reset();
+                    //Decode
+                    //only moving file to the same partition and not locking
+                    bool decode = await FS.DecodeAsync(path, gamePath + info.relativePath, false).ConfigureAwait(false);
+                    if (Interlocked.Increment(ref maxDecompressedCount) > 0)
+                        decompressedNotFull.Set();
+                    if (decode)
+                        return info.sequence.Last().toVersion;
+                    else
+                        return null;
+                }).ConfigureAwait(false);
+            }
+            else //Deltas
+            {
+                Task<int?>? lastVersionTask = null;
+                foreach (DB.DeltaInfo delta in info.sequence)
+                {
+                    //Download
+                    if (diskType == FS.DiskType.HDD)
+                    {
+                        downloadedNotFull.WaitOne();
+                        maxDownloadingThreads.WaitOne();
+                        notDecoding.WaitOne();
+                        notDecoding.Set();
+                    }
+                    else
+                    {
+                        downloadedNotFull.WaitOne();
+                        maxDownloadingThreads.WaitOne();
+                    }
+                    Task<int?>? preVersionTask = lastVersionTask;
+                    lastVersionTask = Task.Run<int?>(async () => {
+                        string? path;
+                        if (registry is not null && registry.TryRemove((info.id, delta.fromVersion, delta.toVersion), out path)
+                            && File.Exists(gamePath + tempDirectory + Path.DirectorySeparatorChar + path))
+                            path = gamePath + tempDirectory + Path.DirectorySeparatorChar + path;
+                        else
+                            path = await FS.DownloadGameFileAsync(info.id, delta.toVersion, delta.fromVersion, gamePath + tempDirectory + Path.DirectorySeparatorChar, cancelToken).ConfigureAwait(false);
+                        maxDownloadingThreads.Release();
+                        if (path is null)
+                            if (preVersionTask is not null)
+                                return await preVersionTask.ConfigureAwait(false);
+                            else
+                                return null;
+                        long size = FS.GetFileSize(path);
+                        if (Interlocked.Add(ref maxDownloadedSize, -size) <= 0)
+                            downloadedNotFull.Reset();
+                        //Decompress
+                        if (diskType == FS.DiskType.HDD)
+                        {
+                            decompressedNotFull.WaitOne();
+                            maxDecompressingThreads.WaitOne();
+                            notDecoding.WaitOne();
+                            notDecoding.Set();
+                        }
+                        else
+                        {
+                            decompressedNotFull.WaitOne();
+                            maxDecompressingThreads.WaitOne();
+                        }
+                        if (cancelToken.IsCancellationRequested)
+                        {
+                            registry?.TryAdd((info.id, delta.fromVersion, delta.toVersion), Path.GetFileName(path));
+                            path = null;
+                        }
+                        else
+                            path = await FS.DecompressIfNecessaryAsync(path);
+                        if (Interlocked.Add(ref maxDownloadedSize, size) > 0)
+                            downloadedNotFull.Set();
+                        maxDecompressingThreads.Release();
+                        if (path is null)
+                            if (preVersionTask is not null)
+                                return await preVersionTask.ConfigureAwait(false);
+                            else
+                                return null;
+                        if (Interlocked.Decrement(ref maxDecompressedCount) == 0)
+                            decompressedNotFull.Reset();
+                        //Decode after previous version has finished decoding
+                        if (preVersionTask is not null)
+                        {
+                            int? preVersion = await preVersionTask.ConfigureAwait(false);
+                            if (preVersion is null || preVersion != delta.fromVersion) //one of the previous tasks failed and this delta cannot decode
+                                return preVersion;
+                        }
+                        notDecoding.WaitOne();
+                        bool decoding;
+                        if (cancelToken.IsCancellationRequested)
+                        {
+                            registry?.TryAdd((info.id, delta.fromVersion, delta.toVersion), Path.GetFileName(path));
+                            decoding = false;
+                        }
+                        else
+                            decoding = await FS.DecodeAsync(path, gamePath + info.relativePath, delta.fromVersion != null).ConfigureAwait(false);
+                        if (Interlocked.Increment(ref maxDecompressedCount) > 0)
+                            decompressedNotFull.Set();
+                        notDecoding.Set();
+                        if (decoding)
+                            return delta.toVersion;
+                        else if (preVersionTask is not null)
+                            return await preVersionTask.ConfigureAwait(false);
+                        else
+                            return null;
+                    });
+                }
+                return await lastVersionTask.ConfigureAwait(false);
             }
         }
 
-        private static string? _launcherCurrentVersion;
-        public static event EventHandler<string?>? LauncherCurrentVersionChanged;
-        public static string? launcherCurrentVersion
+        public static async Task<(int updated, int failed)> UpdateGameFilesAsync(string gamePath, string serverDBPath, CancellationToken cancelToken, IProgress<float>? progress)
         {
-            get
+            try
             {
-                return _launcherCurrentVersion;
+                await using DB db = new(gamePath + LOCALDB_FILENAME, serverDBPath);
+                Model.gamePath = gamePath;
+                Model.diskType = FS.GetDiskType(gamePath) ?? FS.DiskType.HDD;
+                SetUpdatingLimitations();
+                LoadUpdatingCache();
+                //SQLite doesn't support asynchronous operations
+                (int updated, int failed) = await Task.Run(() => db.UpdateFilesAsync(UpdateFileAsync, cancelToken, progress));
+                SaveUpdatingCache();
+                //SQLite doesn't support asynchronous operations
+                await Task.Run(() => db.FixVersionAsync());
+                return (updated, failed);
             }
-            set
+            finally
             {
-                _launcherCurrentVersion = value;
-                LauncherCurrentVersionChanged?.Invoke(null, _launcherCurrentVersion);
+                try { Directory.Delete(gamePath + tempDirectory); } catch { }
             }
         }
+        #endregion
 
-        private static string? _launcherLatestVersion;
-        public static event EventHandler<string?>? LauncherLatestVersionChanged;
-        public static string? launcherLatestVersion
+        #region Repairing Game Files
+        /* Hashing threads:
+         *  HDD: 1
+         *  SSD: cores-1
+         */
+
+        private static Semaphore? maxHashingThreads = null;
+
+        private readonly static ConcurrentBag<MD5> md5s = new();
+
+        //Should be called before repairing
+        private static void SetHashingLimitations()
         {
-            get
+            if (diskType == FS.DiskType.HDD)
             {
-                return _launcherLatestVersion;
+                //hashing is bottlenecked by reading files and concurrent reads create delay
+                maxHashingThreads = new(1, 1);
+                while (md5s.IsEmpty)
+                    md5s.Add(MD5.Create());
             }
-            set
+            else
             {
-                _launcherLatestVersion = value;
-                LauncherLatestVersionChanged?.Invoke(null, _launcherLatestVersion);
+                int coresToUse = Environment.ProcessorCount - 1;
+                if (coresToUse < 1)
+                    coresToUse = 1;
+                maxHashingThreads = new(coresToUse, coresToUse);
+                while (md5s.Count < coresToUse)
+                    md5s.Add(MD5.Create());
             }
         }
 
-        private static int? _gameCurrentVersion;
-        public static event EventHandler<int?>? GameCurrentVersionChanged;
-        public static int? gameCurrentVersion
+        // in: relative path, case-insensitive (ok for windows system)
+        // out: md5 in lower-case or null if non-existent
+        private static async Task<string?> HashFileAsync(string relativePath, CancellationToken cancelToken)
         {
-            get
+            if(maxHashingThreads is null)
+                throw new InvalidOperationException("Limitations of hashing is not set.");
+
+            maxHashingThreads.WaitOne();
+            try
             {
-                return _gameCurrentVersion;
+                if (md5s.TryTake(out MD5 md5))
+                {
+                    string? hash = await Task.Run(() => FS.GetFileMD5(gamePath + relativePath, md5)).ConfigureAwait(false);
+                    md5s.Add(md5);
+                    return hash;
+                }
+                else
+                    throw new InvalidOperationException("No available MD5.");
             }
-            set
+            finally
             {
-                _gameCurrentVersion = value;
-                GameCurrentVersionChanged?.Invoke(null, _gameCurrentVersion);
+                maxHashingThreads.Release();
             }
         }
 
-        private static string? _gameLatestVersion;
-        public static event EventHandler<string?>? GameLatestVersionChanged;
-        public static string? gameLatestVersion
+        public static async Task<(int deleted, int modified)> RepairGameFileEntriesAsync(string gamePath, string serverDBPath, CancellationToken cancelToken, IProgress<float>? progress)
         {
-            get
-            {
-                return _gameLatestVersion;
-            }
-            set
-            {
-                _gameLatestVersion = value;
-                GameLatestVersionChanged?.Invoke(null, _gameLatestVersion);
-            }
+            await using DB db = new(gamePath + LOCALDB_FILENAME, serverDBPath);
+            Model.gamePath = gamePath;
+            Model.diskType = FS.GetDiskType(gamePath) ?? FS.DiskType.HDD;
+            SetHashingLimitations();
+            //SQLite doesn't support asynchronous operations
+            (int deleted, int modified) = await Task.Run(() => db.FixFileInfosAsync((relativePath) => {
+                return FS.GetFileSize(gamePath + relativePath);
+            }, HashFileAsync, cancelToken, progress));
+            //SQLite doesn't support asynchronous operations
+            await Task.Run(() => db.FixVersionAsync());
+            return (deleted, modified);
         }
-
-        public class Log
-        {
-            public class LogLine
-            {
-                private string text = String.Empty;
-                public string Text
-                {
-                    get
-                    {
-                        return text;
-                    }
-                    set
-                    {
-                        text = value;
-                        OnLogLineChanged(ToString());
-                    }
-                }
-
-                public event EventHandler<string>? LogLineChanged;
-
-                protected void OnLogLineChanged(string arg)
-                {
-                    LogLineChanged?.Invoke(this, arg);
-                }
-
-                public LogLine() { }
-
-                public LogLine(string text)
-                {
-                    this.text = text;
-                }
-
-                public override string ToString()
-                {
-                    return Text;
-                }
-            }
-
-            public enum LogLineState
-            {
-                Pending,
-                Interrupted,
-                Finished,
-                Failed
-            }
-
-            public class LogLinePending : LogLine
-            {
-                private string waitingIndicator = "...";
-                public string WaitingIndicator
-                {
-                    get
-                    {
-                        return waitingIndicator;
-                    }
-                    set
-                    {
-                        waitingIndicator = value;
-                        OnLogLineChanged(ToString());
-                    }
-                }
-
-                private string interruptedIndicator = "中斷";
-                public string InterruptedIndicator
-                {
-                    get
-                    {
-                        return interruptedIndicator;
-                    }
-                    set
-                    {
-                        interruptedIndicator = value;
-                        OnLogLineChanged(ToString());
-                    }
-                }
-
-                private string finishedIndicator = "完成";
-                public string FinishedIndicator
-                {
-                    get
-                    {
-                        return finishedIndicator;
-                    }
-                    set
-                    {
-                        finishedIndicator = value;
-                        OnLogLineChanged(ToString());
-                    }
-                }
-
-                private string failedIndicator = "失敗";
-                public string FailedIndicator
-                {
-                    get
-                    {
-                        return failedIndicator;
-                    }
-                    set
-                    {
-                        failedIndicator = value;
-                        OnLogLineChanged(ToString());
-                    }
-                }
-
-                private LogLineState status = LogLineState.Pending;
-                public LogLineState Status
-                {
-                    get
-                    {
-                        return status;
-                    }
-                    set
-                    {
-                        status = value;
-                        OnLogLineChanged(ToString());
-                    }
-                }
-
-                public LogLinePending() { }
-
-                public LogLinePending(string caption) : base(caption) { }
-
-                public override string ToString()
-                {
-                    return Status switch
-                    {
-                        LogLineState.Pending => Text + WaitingIndicator,
-                        LogLineState.Interrupted => Text + WaitingIndicator + InterruptedIndicator,
-                        LogLineState.Finished => Text + WaitingIndicator + FinishedIndicator,
-                        LogLineState.Failed => Text + WaitingIndicator + FailedIndicator,
-                        _ => base.ToString(),
-                    };
-                }
-            }
-
-            public class LogLineProgress : LogLinePending
-            {
-                private float percent = 0;
-                public float Percent
-                {
-                    get
-                    {
-                        return percent;
-                    }
-                    set
-                    {
-                        percent = value;
-                        OnLogLineChanged(ToString());
-                    }
-                }
-
-                public LogLineProgress() { }
-
-                public LogLineProgress(string caption) : base(caption) { }
-
-                public override string ToString()
-                {
-                    return Status switch
-                    {
-                        LogLineState.Pending => Text + WaitingIndicator + $"{Percent:F2}%",
-                        _ => base.ToString(),
-                    };
-                }
-            }
-
-            public event EventHandler<string>? LogChanged;
-
-            protected void OnLogChanged(string arg)
-            {
-                LogChanged?.Invoke(this, arg);
-            }
-
-            private void handlerOnLineChange(object? sender, string arg)
-            {
-                OnLogChanged(ToString());
-            }
-
-            private readonly List<LogLine> lines = new();
-
-            public void AddLine(LogLine line)
-            {
-                lines.Add(line);
-                line.LogLineChanged += handlerOnLineChange;
-                OnLogChanged(ToString());
-            }
-
-            public bool RemoveLine(LogLine line)
-            {
-                bool result = lines.Remove(line);
-                if (result)
-                {
-                    line.LogLineChanged -= handlerOnLineChange;
-                    OnLogChanged(ToString());
-                }
-                return result;
-            }
-
-            public override string ToString()
-            {
-                return String.Join('\n', lines);
-            }
-        }
-
-        private static Log? _log = null;
-        public static event EventHandler<Log?>? LogChanged;
-        public static event EventHandler<string>? LogContentChanged;
-        private static void handlerOnLogContentChange(object? sender, string arg)
-        {
-            LogContentChanged?.Invoke(null, arg);
-        }
-        public static Log? log
-        {
-            get
-            {
-                return _log;
-            }
-            set
-            {
-                if(_log is not null)
-                    _log.LogChanged -= handlerOnLogContentChange;
-                _log = value;
-                if (_log is not null)
-                    _log.LogChanged += handlerOnLogContentChange;
-                LogChanged?.Invoke(null, _log);
-            }
-        }
-
-        private static bool _operationInProgress = false;
-        public static event EventHandler<bool>? OperationInProgressChanged;
-        public static bool operationInProgress
-        {
-            get
-            {
-                return _operationInProgress;
-            }
-            set
-            {
-                _operationInProgress = value;
-                OperationInProgressChanged?.Invoke(null, _operationInProgress);
-            }
-        }
+        #endregion
 
         public const string LAUNCHER_FILENAME = "Launcher.exe";
         public const string LOCALDB_FILENAME = "local.db";
 
+        public static async Task<string?> GetLauncherCurrentVersionAsync(string gamePath)
+        {
+            string launcherPath = gamePath + LAUNCHER_FILENAME;
+            if (!File.Exists(launcherPath))
+                return null;
+            else
+                return FileVersionInfo.GetVersionInfo(launcherPath).FileVersion;
+        }
+
+        public static async Task<int?> GetGameCurrentVersionAsync(string gamePath)
+        {
+            string localDBPath = gamePath + LOCALDB_FILENAME;
+            if (!File.Exists(localDBPath))
+                return null;
+            else
+            {
+                using DB db = new(localDBPath);
+                //SQLite doesn't support asynchronous operations
+                return await Task.Run(() => db.GetVersionAsync());
+            }
+        }
+
         public static string? launcherInstallerUrl = null;
         public static string? serverDBArchiveUrl = null;
 
-        public static CancellationTokenSource? cancellationTokenSource;
+        public static async Task<string?> GetLauncherLatestVersionAsync()
+        {
+            var launcherInfo = await FS.RetrieveLauncherInfoAsync(CancellationToken.None);
+            launcherInstallerUrl = launcherInfo.installerUrl;
+            return launcherInfo.latestVersion;
+        }
+
+        public static async Task<string?> GetGameLatestVersionAsync()
+        {
+            var gameInfo = await FS.RetrieveGameFilesInfoAsync(CancellationToken.None);
+            serverDBArchiveUrl = gameInfo.serverDBArchiveUrl;
+            return gameInfo.latestVersion;
+        }
     }
 }

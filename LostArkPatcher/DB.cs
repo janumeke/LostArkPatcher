@@ -213,12 +213,33 @@ namespace LostArkPatcher
             else
                 return Convert.ToInt32(version);
         }
-
+        
+        /// <exception cref="InvalidOperationException"/>
         public async Task FixVersionAsync()
         {
-            object? _version = await file_version.SelectScalarAsync(column: "max(version)").ConfigureAwait(false);
-            if(_version != DBNull.Value)
-                await local_info.ReplaceAsync("key, value", $"'version', {Convert.ToInt32(_version)}").ConfigureAwait(false);
+            if (fileInfo is null)
+                throw new InvalidOperationException("Server DB is not attched.");
+
+            object? _version;
+            SQLiteCommand dbCommand = dbConnection.CreateCommand();
+            await using (dbCommand.ConfigureAwait(false))
+            {
+                dbCommand.CommandText = SQL.Row.LeftJoin(
+                    fileInfo.name,
+                    file_version.name,
+                    "left.unique_path = right.unique_path",
+                    "right.version is null or left.version > right.version",
+                    "min(left.version)"
+                );
+                _version = await dbCommand.ExecuteScalarAsync().ConfigureAwait(false);
+            }
+            if (_version != DBNull.Value)
+                await local_info.ReplaceAsync("key, value", $"'version', {Convert.ToInt32(_version) - 1}").ConfigureAwait(false);
+            else
+            {
+                _version = await fileInfo.SelectScalarAsync(column: "max(version)").ConfigureAwait(false);
+                await local_info.ReplaceAsync("key, value", $"'version', {(_version != DBNull.Value ? Convert.ToInt32(_version) : 0)}").ConfigureAwait(false);
+            }
         }
 
         public async Task<bool> CheckSchemaAsync()

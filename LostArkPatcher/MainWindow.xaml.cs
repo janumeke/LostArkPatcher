@@ -10,8 +10,7 @@ namespace LostArkPatcher
         public MainWindow()
         {
             InitializeComponent();
-            Controllers.InitializeOnMainWindowLoad(this);
-            Controllers.SaveSettingsOnMainWindowClose(this);
+            Closed += ((MainViewModel)DataContext).OnWindowClosed;
         }
     }
 }
