@@ -350,14 +350,35 @@ namespace LostArkPatcher
                 ChooseGameDirectory.NotifyCanExecuteChanged();
                 UpdateOrCancelAsync.NotifyCanExecuteChanged();
                 RepairOrCancelAsync.NotifyCanExecuteChanged();
+                switch (operationInProgress)
+                {
+                    case Operation.Update:
+                        RepairArrowToggleVisible = true;
+                        RepairArrowToggleEnabled = false;
+                        break;
+                    case Operation.Repair:
+                        RepairArrowToggleVisible = false;
+                        break;
+                    default:
+                        RepairArrowToggleVisible = true;
+                        RepairArrowToggleEnabled = true;
+                        break;
+                }
+                RepairPopupOpen = false;
             }
         }
 
         private CancellationTokenSource? cancellationTokenSource;
 
+        public enum OperationMode
+        {
+            Quick,
+            Full
+        }
+
         public RelayCommand ChooseGameDirectory { get; }
         public AsyncRelayCommand UpdateOrCancelAsync { get; }
-        public AsyncRelayCommand RepairOrCancelAsync { get; }
+        public AsyncRelayCommand<OperationMode> RepairOrCancelAsync { get; }
 
         public MainViewModel()
         {
@@ -371,8 +392,8 @@ namespace LostArkPatcher
                 GameLatestVersion = preTask.Result;
             });
             ChooseGameDirectory = new(ExecuteChooseGameDirectory, CanChooseGameDirectory);
-            UpdateOrCancelAsync = new(ExecuteUpdateOrCancelAsync, CanUpdateOrCancelAsync, AsyncRelayCommandOptions.AllowConcurrentExecutions);
-            RepairOrCancelAsync = new(ExecuteRepairOrCancelAsync, CanRepairOrCancelAsync, AsyncRelayCommandOptions.AllowConcurrentExecutions);
+            UpdateOrCancelAsync = new(ExecuteUpdateOrCancelAsync, CanUpdateOrCancel, AsyncRelayCommandOptions.AllowConcurrentExecutions);
+            RepairOrCancelAsync = new(ExecuteRepairOrCancelAsync, CanRepairOrCancel, AsyncRelayCommandOptions.AllowConcurrentExecutions);
         }
 
         public void OnWindowClosed(object? sender, EventArgs e)
@@ -419,7 +440,7 @@ namespace LostArkPatcher
                 if (cancellationTokenSource is not null && !cancellationTokenSource.IsCancellationRequested)
                 {
                     cancellationTokenSource.Cancel();
-                    Log?.AddLine(new LogLine("已要求中斷"));
+                    UpdateButtonText = "正在中斷...";
                 }
                 return;
             }
@@ -433,119 +454,129 @@ namespace LostArkPatcher
             OperationInProgress = Operation.Update;
             string originalButtonText = UpdateButtonText;
             UpdateButtonText = "中斷";
-
-            Log = new();
-            LogLinePending lastLine;
-
-            if (LauncherLatestVersion is null || GameLatestVersion is null)
-            {
-                lastLine = new LogLinePending("取得最新資訊");
-                Log.AddLine(lastLine);
-                if (LauncherLatestVersion is null)
-                    LauncherLatestVersion = await Model.GetLauncherLatestVersionAsync();
-                if (GameLatestVersion is null)
-                    GameLatestVersion = await Model.GetGameLatestVersionAsync();
-                if (cancellationTokenSource.IsCancellationRequested)
-                {
-                    lastLine.Status = LogLineState.Interrupted;
-                    return;
-                }
-                else if (LauncherLatestVersion is null || GameLatestVersion is null)
-                {
-                    lastLine.Status = LogLineState.Failed;
-                    return;
-                }
-                else
-                    lastLine.Status = LogLineState.Finished;
-            }
-
-            if (LauncherCurrentVersion is null || LauncherCurrentVersion != LauncherLatestVersion)
-            {
-                lastLine = new LogLinePending("更新啟動器");
-                Log.AddLine(lastLine);
-                if (Model.launcherInstallerUrl is null)
-                    lastLine.Status = LogLineState.Failed;
-                else
-                {
-                    bool updatingLauncher = await FS.DownloadLauncherAsync(Model.launcherInstallerUrl, GameDirectory, cancellationTokenSource.Token);
-                    if (updatingLauncher)
-                        LauncherCurrentVersion = await Model.GetLauncherCurrentVersionAsync(GameDirectory);
-                    if (cancellationTokenSource.IsCancellationRequested)
-                    {
-                        lastLine.Status = LogLineState.Interrupted;
-                        return;
-                    }
-                    else if (updatingLauncher)
-                        lastLine.Status = LogLineState.Finished;
-                    else
-                        lastLine.Status = LogLineState.Failed;
-                }
-            }
-                
-            lastLine = new LogLinePending("下載伺服器資料庫");
-            Log.AddLine(lastLine);
-            string? serverDBPath = null;
             try
             {
-                if (Model.serverDBArchiveUrl is null)
+                Log = new();
+                LogLinePending lastLine;
+
+                if (LauncherLatestVersion is null || Model.LauncherInstallerUrl is null || Model.ServerDBArchiveUrl is null)
                 {
-                    lastLine.Status = LogLineState.Failed;
-                    return;
-                }
-                else
-                {
-                    serverDBPath = await FS.DownloadServerDBAsync(Model.serverDBArchiveUrl, null, cancellationTokenSource.Token);
-                    if (cancellationTokenSource.IsCancellationRequested)
-                    {
-                        lastLine.Status = LogLineState.Interrupted;
-                        return;
-                    }
-                    else if (serverDBPath is null)
-                    {
+                    lastLine = new LogLinePending("取得最新資訊");
+                    Log.AddLine(lastLine);
+                    if (LauncherLatestVersion is null || Model.LauncherInstallerUrl is null)
+                        LauncherLatestVersion = await Model.GetLauncherLatestVersionAsync();
+                    if (Model.ServerDBArchiveUrl is null)
+                        GameLatestVersion = await Model.GetGameLatestVersionAsync();
+                    if (LauncherLatestVersion is null || Model.LauncherInstallerUrl is null || Model.ServerDBArchiveUrl is null)
                         lastLine.Status = LogLineState.Failed;
-                        return;
-                    }
                     else
                         lastLine.Status = LogLineState.Finished;
                 }
 
-                lastLine = new LogLinePending("檢查本地資料庫");
-                Log.AddLine(lastLine);
-                bool checkingSchema;
-                await using (DB db = new(GameDirectory + Model.LOCALDB_FILENAME))
-                    //SQLite doesn't support asynchronous operations
-                    checkingSchema = await Task.Run(() => db.CheckSchemaAsync());
-                lastLine.Status = LogLineState.Finished;
-                if (!checkingSchema)
+                if (cancellationTokenSource.IsCancellationRequested)
                 {
-                    Log.AddLine(new LogLine("發現錯誤，請先修復"));
+                    Log.AddLine(new LogLine("已中斷"));
                     return;
                 }
 
-                lastLine = new LogLineProgress("更新所有檔案");
-                Log.AddLine(lastLine);
-                (int updated, int failed) = await Model.UpdateGameFilesAsync(GameDirectory, serverDBPath, cancellationTokenSource.Token, new Progress<float>((ratio) => {
-                    ((LogLineProgress)lastLine).Percent = ratio * 100;
-                }));
+                if (LauncherLatestVersion is null)
+                    Log.AddLine(new LogLine("啟動器最新版本未知，略過更新"));
+                else if (LauncherCurrentVersion is null || LauncherCurrentVersion != LauncherLatestVersion)
+                {
+                    lastLine = new LogLinePending("更新啟動器");
+                    Log.AddLine(lastLine);
+                    if (Model.LauncherInstallerUrl is null)
+                        lastLine.Status = LogLineState.Failed;
+                    else if (await FS.DownloadLauncherAsync(Model.LauncherInstallerUrl, GameDirectory, cancellationTokenSource.Token))
+                    {
+                        lastLine.Status = LogLineState.Finished;
+                        LauncherCurrentVersion = await Model.GetLauncherCurrentVersionAsync(GameDirectory);
+                    }
+                    else if (cancellationTokenSource.IsCancellationRequested)
+                        lastLine.Status = LogLineState.Interrupted;
+                    else
+                        lastLine.Status = LogLineState.Failed;
+                }
+
                 if (cancellationTokenSource.IsCancellationRequested)
-                    lastLine.Status = LogLineState.Interrupted;
+                {
+                    Log.AddLine(new LogLine("已中斷"));
+                    return;
+                }
+
+                if (!File.Exists(GameDirectory + Model.LOCALDB_FILENAME))
+                {
+                    Log.AddLine(new LogLine("找不到本地資料庫，請先修復"));
+                    return;
+                }
+
+                lastLine = new LogLinePending("下載伺服器資料庫");
+                Log.AddLine(lastLine);
+                if (Model.ServerDBArchiveUrl is null)
+                    lastLine.Status = LogLineState.Failed;
                 else
-                    lastLine.Status = LogLineState.Finished;
-                if (updated > 0)
-                    Log.AddLine(new LogLine($"  已更新：{updated}"));
-                if (failed > 0)
-                    Log.AddLine(new LogLine($"  更新失敗：{failed}"));
-                GameCurrentVersion = await Model.GetGameCurrentVersionAsync(GameDirectory);
+                {
+                    string? serverDBPath = await FS.DownloadServerDBAsync(Model.ServerDBArchiveUrl, null, cancellationTokenSource.Token);
+                    try
+                    {
+                        if (serverDBPath is not null)
+                            lastLine.Status = LogLineState.Finished;
+                        else if (cancellationTokenSource.IsCancellationRequested)
+                            lastLine.Status = LogLineState.Interrupted;
+                        else
+                        {
+                            lastLine.Status = LogLineState.Failed;
+                            return;
+                        }
+
+                        if (cancellationTokenSource.IsCancellationRequested)
+                        {
+                            Log.AddLine(new LogLine("已中斷"));
+                            return;
+                        }
+
+                        lastLine = new LogLinePending("檢查本地資料庫");
+                        Log.AddLine(lastLine);
+                        bool checkingSchema;
+                        await using (DB db = new(GameDirectory + Model.LOCALDB_FILENAME))
+                            //SQLite doesn't support asynchronous operations
+                            checkingSchema = await Task.Run(() => db.CheckSchemaAsync());
+                        lastLine.Status = LogLineState.Finished;
+                        if (!checkingSchema)
+                        {
+                            Log.AddLine(new LogLine("發現錯誤，請先修復"));
+                            return;
+                        }
+
+                        lastLine = new LogLineProgress("更新所有檔案");
+                        Log.AddLine(lastLine);
+                        (int updated, int failed) = await Model.UpdateGameFilesAsync(GameDirectory, serverDBPath, cancellationTokenSource.Token, new Progress<float>((ratio) => {
+                            ((LogLineProgress)lastLine).Percent = ratio * 100;
+                        }));
+                        if (cancellationTokenSource.IsCancellationRequested)
+                            lastLine.Status = LogLineState.Interrupted;
+                        else
+                            lastLine.Status = LogLineState.Finished;
+                        if (updated > 0)
+                            Log.AddLine(new LogLine($"  已更新：{updated}"));
+                        if (failed > 0)
+                            Log.AddLine(new LogLine($"  更新失敗：{failed}"));
+                        GameCurrentVersion = await Model.GetGameCurrentVersionAsync(GameDirectory);
+                    }
+                    finally
+                    {
+                        try { File.Delete(serverDBPath); } catch { }
+                    }
+                }
             }
             finally
             {
-                try { File.Delete(serverDBPath); } catch { }
                 OperationInProgress = null;
                 UpdateButtonText = originalButtonText;
             }
         }
 
-        public bool CanUpdateOrCancelAsync()
+        public bool CanUpdateOrCancel()
         {
             return OperationInProgress is null || OperationInProgress == Operation.Update;
         }
@@ -564,14 +595,56 @@ namespace LostArkPatcher
             }
         }
 
-        public async Task ExecuteRepairOrCancelAsync()
+        private bool repairArrowToggleVisible = true;
+        public bool RepairArrowToggleVisible
+        {
+            get
+            {
+                return repairArrowToggleVisible;
+            }
+            set
+            {
+                repairArrowToggleVisible = value;
+                OnPropertyChanged();
+            }
+        }
+
+        private bool repairArrowToggleEnabled = true;
+        public bool RepairArrowToggleEnabled
+        {
+            get
+            {
+                return repairArrowToggleEnabled;
+            }
+            set
+            {
+                repairArrowToggleEnabled = value;
+                OnPropertyChanged();
+            }
+        }
+
+        private bool repairPopupOpen = false;
+        public bool RepairPopupOpen
+        {
+            get
+            {
+                return repairPopupOpen;
+            }
+            set
+            {
+                repairPopupOpen = value;
+                OnPropertyChanged();
+            }
+        }
+
+        public async Task ExecuteRepairOrCancelAsync(OperationMode mode)
         {
             if (OperationInProgress == Operation.Repair)
             {
                 if (cancellationTokenSource is not null && !cancellationTokenSource.IsCancellationRequested)
                 {
                     cancellationTokenSource.Cancel();
-                    Log?.AddLine(new LogLine("已要求中斷"));
+                    RepairButtonText = "正在中斷...";
                 }
                 return;
             }
@@ -585,127 +658,144 @@ namespace LostArkPatcher
             OperationInProgress = Operation.Repair;
             string originalButtonText = RepairButtonText;
             RepairButtonText = "中斷";
-
-            Log = new();
-            LogLinePending lastLine, stageLine;
-
-            if (Model.serverDBArchiveUrl is null)
-            {
-                lastLine = new LogLinePending("取得最新資訊");
-                Log.AddLine(lastLine);
-                GameLatestVersion = await Model.GetGameLatestVersionAsync();
-                if (cancellationTokenSource.IsCancellationRequested)
-                {
-                    lastLine.Status = LogLineState.Interrupted;
-                    return;
-                }
-                else if (Model.serverDBArchiveUrl is null)
-                {
-                    lastLine.Status = LogLineState.Failed;
-                    return;
-                }
-                else
-                    lastLine.Status = LogLineState.Finished;
-            }
-
-            string? serverDBPath = null;
             try
             {
-                lastLine = new LogLinePending("下載伺服器資料庫");
-                Log.AddLine(lastLine);
-                serverDBPath = await FS.DownloadServerDBAsync(Model.serverDBArchiveUrl, null, cancellationTokenSource.Token);
+                Log = new();
+                LogLinePending lastLine, stageLine;
+
+                if (Model.ServerDBArchiveUrl is null)
+                {
+                    lastLine = new LogLinePending("取得最新資訊");
+                    Log.AddLine(lastLine);
+                    GameLatestVersion = await Model.GetGameLatestVersionAsync();
+                    if (Model.ServerDBArchiveUrl is not null)
+                        lastLine.Status = LogLineState.Finished;
+                    else if (cancellationTokenSource.IsCancellationRequested)
+                        lastLine.Status = LogLineState.Interrupted;
+                    else
+                    {
+                        lastLine.Status = LogLineState.Failed;
+                        return;
+                    }
+                }
+
                 if (cancellationTokenSource.IsCancellationRequested)
                 {
-                    lastLine.Status = LogLineState.Interrupted;
+                    Log.AddLine(new LogLine("已中斷"));
                     return;
                 }
-                else if (serverDBPath is null)
-                {
-                    lastLine.Status = LogLineState.Failed;
-                    return;
-                }
-                else
-                    lastLine.Status = LogLineState.Finished;
 
-                stageLine = new LogLinePending("檢查本地資料庫");
-                Log.AddLine(stageLine);
+                lastLine = new LogLinePending("下載伺服器資料庫");
+                Log.AddLine(lastLine);
+                string? serverDBPath = await FS.DownloadServerDBAsync(Model.ServerDBArchiveUrl, null, cancellationTokenSource.Token);
                 try
                 {
-                    int deleted, inserted, modified;
+                    if (serverDBPath is not null)
+                        lastLine.Status = LogLineState.Finished;
+                    else if(cancellationTokenSource.IsCancellationRequested)
+                        lastLine.Status = LogLineState.Interrupted;
+                    else
+                    {
+                        lastLine.Status = LogLineState.Failed;
+                        return;
+                    }
+
+                    if (cancellationTokenSource.IsCancellationRequested)
+                    {
+                        Log.AddLine(new LogLine("已中斷"));
+                        return;
+                    }
+
+                    stageLine = new LogLinePending("檢查本地資料庫");
+                    Log.AddLine(stageLine);
+                    try
+                    {
+                        int deleted, inserted, modified;
+
+                        await using (DB db = new(GameDirectory + Model.LOCALDB_FILENAME, serverDBPath))
+                        {
+                            lastLine = new LogLinePending("├檢查結構");
+                            Log.AddLine(lastLine);
+                            //SQLite doesn't support asynchronous operations
+                            bool checkingSchema = await Task.Run(() => db.CheckSchemaAsync());
+                            lastLine.Status = LogLineState.Finished;
+                            if (!checkingSchema)
+                            {
+                                lastLine = new LogLinePending("├修復結構");
+                                Log.AddLine(lastLine);
+                                //SQLite doesn't support asynchronous operations
+                                await Task.Run(() => db.FixSchemaAsync());
+                                lastLine.Status = LogLineState.Finished;
+                            }
+
+                            if (cancellationTokenSource.IsCancellationRequested)
+                            {
+                                Log.AddLine(new LogLine("已中斷"));
+                                return;
+                            }
+
+                            lastLine = new LogLinePending("├檢查項目");
+                            Log.AddLine(lastLine);
+                            //SQLite doesn't support asynchronous operations
+                            (deleted, inserted) = await Task.Run(() => db.FixFileKeysAsync());
+                            lastLine.Status = LogLineState.Finished;
+                        }
+
+                        if (cancellationTokenSource.IsCancellationRequested)
+                        {
+                            Log.AddLine(new LogLine("已中斷"));
+                            return;
+                        }
+
+                        lastLine = new LogLineProgress("└檢查資料");
+                        Log.AddLine(lastLine);
+                        (deleted, modified) = await Model.RepairGameFileEntriesAsync(GameDirectory, serverDBPath, mode == OperationMode.Full, cancellationTokenSource.Token, new Progress<float>((ratio) => {
+                            ((LogLineProgress)lastLine).Percent = ratio * 100;
+                        }));
+                        if (cancellationTokenSource.IsCancellationRequested)
+                            lastLine.Status = LogLineState.Interrupted;
+                        else
+                            lastLine.Status = LogLineState.Finished;
+                        if (deleted + modified > 0)
+                            Log.AddLine(new LogLine($"    已修復：{deleted + modified}"));
+                        GameCurrentVersion = await Model.GetGameCurrentVersionAsync(GameDirectory);
+                    }
+                    finally
+                    {
+                        if (cancellationTokenSource.IsCancellationRequested)
+                            stageLine.Status = LogLineState.Interrupted;
+                        else
+                            stageLine.Status = LogLineState.Finished;
+                    }
+
+                    if (cancellationTokenSource.IsCancellationRequested)
+                    {
+                        Log.AddLine(new LogLine("已中斷"));
+                        return;
+                    }
 
                     await using (DB db = new(GameDirectory + Model.LOCALDB_FILENAME, serverDBPath))
                     {
-                        lastLine = new LogLinePending("├檢查結構");
-                        Log.AddLine(lastLine);
                         //SQLite doesn't support asynchronous operations
-                        bool checkingSchema = await Task.Run(() => db.CheckSchemaAsync());
-                        lastLine.Status = LogLineState.Finished;
-                        if (!checkingSchema)
-                        {
-                            lastLine = new LogLinePending("├修復結構");
-                            Log.AddLine(lastLine);
-                            //SQLite doesn't support asynchronous operations
-                            await Task.Run(() => db.FixSchemaAsync());
-                            lastLine.Status = LogLineState.Finished;
-                        }
-
-                        if (cancellationTokenSource.IsCancellationRequested)
-                            return;
-
-                        lastLine = new LogLinePending("├檢查項目");
-                        Log.AddLine(lastLine);
-                        //SQLite doesn't support asynchronous operations
-                        (deleted, inserted) = await Task.Run(() => db.FixFileKeysAsync());
-                        if (cancellationTokenSource.IsCancellationRequested)
-                        {
-                            lastLine.Status = LogLineState.Interrupted;
-                            return;
-                        }
-                        else
-                            lastLine.Status = LogLineState.Finished;
+                        int outdated = await Task.Run(() => db.GetOutdatedCountAsync());
+                        if (outdated > 0)
+                            Log.AddLine(new LogLine($"需要更新：{outdated}"));
                     }
-
-                    lastLine = new LogLineProgress("└檢查資料");
-                    Log.AddLine(lastLine);
-                    (deleted, modified) = await Model.RepairGameFileEntriesAsync(GameDirectory, serverDBPath, cancellationTokenSource.Token, new Progress<float>((ratio) => {
-                        ((LogLineProgress)lastLine).Percent = ratio * 100;
-                    }));
-                    if (cancellationTokenSource.IsCancellationRequested)
-                        lastLine.Status = LogLineState.Interrupted;
-                    else
-                        lastLine.Status = LogLineState.Finished;
-                    if (deleted + modified > 0)
-                        Log.AddLine(new LogLine($"    已修復：{deleted + modified}"));
-                    GameCurrentVersion = await Model.GetGameCurrentVersionAsync(GameDirectory);
                 }
                 finally
                 {
-                    if (cancellationTokenSource.IsCancellationRequested)
-                        stageLine.Status = LogLineState.Interrupted;
-                    else
-                        stageLine.Status = LogLineState.Finished;
-                }
-
-                if (cancellationTokenSource.IsCancellationRequested)
-                    return;
-
-                await using (DB db = new(GameDirectory + Model.LOCALDB_FILENAME, serverDBPath))
-                {
-                    //SQLite doesn't support asynchronous operations
-                    int outdated = await Task.Run(() => db.GetOutdatedCountAsync());
-                    if (outdated > 0)
-                        Log.AddLine(new LogLine($"需要更新：{outdated}"));
+                    try { File.Delete(serverDBPath); } catch { }
                 }
             }
             finally
             {
-                try { File.Delete(serverDBPath); } catch { }
                 OperationInProgress = null;
                 RepairButtonText = originalButtonText;
             }
+
         }
 
-        public bool CanRepairOrCancelAsync()
+        public bool CanRepairOrCancel(OperationMode mode)
         {
             return OperationInProgress is null || OperationInProgress == Operation.Repair;
         }

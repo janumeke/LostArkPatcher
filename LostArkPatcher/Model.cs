@@ -246,7 +246,7 @@ namespace LostArkPatcher
             }
         }
 
-        public static async Task<(int updated, int failed)> UpdateGameFilesAsync(string gamePath, string serverDBPath, CancellationToken cancelToken, IProgress<float>? progress)
+        public static async Task<(int updated, int failed)> UpdateGameFilesAsync(string gamePath, string serverDBPath, CancellationToken cancelToken, IProgress<float>? progress = null)
         {
             try
             {
@@ -325,7 +325,7 @@ namespace LostArkPatcher
             }
         }
 
-        public static async Task<(int deleted, int modified)> RepairGameFileEntriesAsync(string gamePath, string serverDBPath, CancellationToken cancelToken, IProgress<float>? progress)
+        public static async Task<(int deleted, int modified)> RepairGameFileEntriesAsync(string gamePath, string serverDBPath, bool fully, CancellationToken cancelToken, IProgress<float>? progress = null)
         {
             await using DB db = new(gamePath + LOCALDB_FILENAME, serverDBPath);
             Model.gamePath = gamePath;
@@ -334,7 +334,7 @@ namespace LostArkPatcher
             //SQLite doesn't support asynchronous operations
             (int deleted, int modified) = await Task.Run(() => db.FixFileInfosAsync((relativePath) => {
                 return FS.GetFileSize(gamePath + relativePath);
-            }, HashFileAsync, cancelToken, progress));
+            }, HashFileAsync, cancelToken, progress, fully));
             //SQLite doesn't support asynchronous operations
             await Task.Run(() => db.FixVersionAsync());
             return (deleted, modified);
@@ -366,20 +366,20 @@ namespace LostArkPatcher
             }
         }
 
-        public static string? launcherInstallerUrl = null;
-        public static string? serverDBArchiveUrl = null;
+        public static string? LauncherInstallerUrl { get; private set; } = null;
+        public static string? ServerDBArchiveUrl { get; private set; } = null;
 
         public static async Task<string?> GetLauncherLatestVersionAsync()
         {
             var launcherInfo = await FS.RetrieveLauncherInfoAsync(CancellationToken.None);
-            launcherInstallerUrl = launcherInfo.installerUrl;
+            LauncherInstallerUrl = launcherInfo.installerUrl;
             return launcherInfo.latestVersion;
         }
 
         public static async Task<string?> GetGameLatestVersionAsync()
         {
             var gameInfo = await FS.RetrieveGameFilesInfoAsync(CancellationToken.None);
-            serverDBArchiveUrl = gameInfo.serverDBArchiveUrl;
+            ServerDBArchiveUrl = gameInfo.serverDBArchiveUrl;
             return gameInfo.latestVersion;
         }
     }

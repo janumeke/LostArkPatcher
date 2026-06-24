@@ -715,7 +715,7 @@ namespace LostArkPatcher
                         file_version.name,
                         fileInfo.name,
                         @"left.unique_path = right.unique_path and left.size = right.size
-                      and left.version = right.version",
+                            and left.version = right.version",
                         null,
                         "distinct left.unique_path"
                     );
@@ -723,7 +723,7 @@ namespace LostArkPatcher
                         file_version.name,
                         fileInfo.name,
                         @"left.unique_path = right.unique_path and left.size = right.size
-                        and left.hash = right.hash",
+                            and left.hash = right.hash",
                         null,
                         "distinct left.unique_path"
                     );
@@ -731,7 +731,7 @@ namespace LostArkPatcher
                         file_version.name,
                         fileInfo.name,
                         @"left.unique_path = right.unique_path and left.size = right.size
-                      and left.version = right.version and (left.hash is null or left.hash <> right.hash)",
+                            and left.version = right.version and (left.hash is null or left.hash <> right.hash)",
                         null,
                         "distinct left.unique_path"
                     );
@@ -739,7 +739,7 @@ namespace LostArkPatcher
                         file_version.name,
                         fileInfo.name,
                         @"left.unique_path = right.unique_path and left.size = right.size
-                      and (left.version is null or left.version <> right.version) and left.hash = right.hash",
+                            and (left.version is null or left.version <> right.version) and left.hash = right.hash",
                         null,
                         "distinct left.unique_path"
                     );
@@ -931,6 +931,8 @@ namespace LostArkPatcher
                     }
                 }
 
+                //here: every row in 'pending_changes' has either all columns not null (for simple update) or only 'unique_path' not null (for hashing)
+
                 //Calculate the file hash:
                 uint hashingCount = 0;
                 ConcurrentExclusiveSchedulerPair schedulerPair = new(TaskScheduler.Default);
@@ -986,9 +988,14 @@ namespace LostArkPatcher
                     while (hashingCount > 0)
                         await Task.Delay(500).ConfigureAwait(false);
                 }
-                progressReporter?.SetStageTarget(0.95f, 0.01f);
+                progressReporter?.SetStageTarget(0.95f, 0.02f);
 
-                //hash matched in server db: fill in the version
+                //here: every row in 'pending_changes' has
+                //1. all columns not null (for simple update)
+                //2. only 'unique_path' not null (from canceled hashing)
+                //3. exactly 'unique_path' and 'hash' not null (from finished hashing)
+
+                //hash matched in server db: fill in the rest
                 dbCommand.CommandText = SQL.Row.ReplaceQuery(
                     pending_changes.name,
                     "unique_path, version, size, hash, property", 
@@ -996,7 +1003,7 @@ namespace LostArkPatcher
                         fileInfo.name,
                         SQL.Row.Select(
                             pending_changes.name,
-                            "version is null"
+                            "hash is not null and (version is null or size is null or property is null)"
                         ),
                         "left.unique_path = right.unique_path and left.hash = right.hash",
                         null,
@@ -1004,7 +1011,7 @@ namespace LostArkPatcher
                     )
                 );
                 await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                progressReporter?.SetStageTarget(0.96f, 0.01f);
+                progressReporter?.SetStageTarget(0.97f, 0.01f);
 
                 //no such hash in server db: delete entry
                 dbCommand.CommandText = SQL.Row.DeleteInQuery(
@@ -1012,7 +1019,7 @@ namespace LostArkPatcher
                     "unique_path",
                     SQL.Row.Select(
                         pending_changes.name,
-                        "version is null and hash is not null"
+                        "hash is not null and (version is null or size is null or property is null)"
                     )
                 );
                 deleted += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
@@ -1023,10 +1030,18 @@ namespace LostArkPatcher
                 dbCommand.CommandText = SQL.Row.ReplaceQuery(
                     file_version.name,
                     "unique_path, version, size, hash, property",
-                    SQL.Row.Select(
-                        pending_changes.name,
-                        "unique_path is not null and version is not null and size is not null and hash is not null and property is not null",
-                        "unique_path, version, size, hash, property"
+                    //only rows with any column changed,
+                    //because in full mode, files with a correct row will still be hashed
+                    SQL.Row.QueryLeftJoin(
+                        SQL.Row.Select(
+                            pending_changes.name,
+                            "unique_path is not null and version is not null and size is not null and hash is not null and property is not null",
+                            "unique_path, version, size, hash, property"
+                        ),
+                        file_version.name,
+                        "left.unique_path = right.unique_path and left.version = right.version and left.size = right.size and left.hash = right.hash and left.property = right.property",
+                        "right.unique_path is null",
+                        "left.unique_path, left.version, left.size, left.hash, left.property"
                     )
                 );
                 modified += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);

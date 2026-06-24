@@ -9,6 +9,9 @@
     <Window.DataContext>
         <local:MainViewModel/>
     </Window.DataContext>
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="converterBooleanToVisibility"/>
+    </Window.Resources>
     <WrapPanel Margin="10,10,0,5">
         <StackPanel Margin="0,0,10,5" Width="175">
             <Button Margin="0,0,0,5" Height="25" Content="指定遊戲位置" FontSize="16" Command="{Binding ChooseGameDirectory}"/>
@@ -40,7 +43,18 @@
                 </StackPanel>
             </Border>
             <Button Margin="0,0,0,5" Height="35" FontSize="16" Content="{Binding UpdateButtonText}" Command="{Binding UpdateOrCancelAsync}"/>
-            <Button Margin="0,0,0,0" Height="35" FontSize="16" Content="{Binding RepairButtonText}" Command="{Binding RepairOrCancelAsync}"/>
+            <Grid Margin="0,0,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition/>
+                    <ColumnDefinition Width="20"/>
+                </Grid.ColumnDefinitions>
+                <Button x:Name="RepairButton" Grid.Column="0" Grid.ColumnSpan="2" Height="35" FontSize="16" Content="{Binding RepairButtonText}" Command="{Binding RepairOrCancelAsync}" CommandParameter="{x:Static local:MainViewModel+OperationMode.Quick}"/>
+                <ToggleButton x:Name="RepairArrowToggle" Grid.Column="1" Height="35" FontSize="14" Content="▼" Visibility="{Binding RepairArrowToggleVisible, Converter={StaticResource converterBooleanToVisibility}}" IsEnabled="{Binding RepairArrowToggleEnabled}" IsChecked="{Binding RepairPopupOpen}"/>
+            </Grid>
+            <Popup PopupAnimation="Scroll" IsOpen="{Binding RepairPopupOpen, Mode=TwoWay}" StaysOpen="False"
+                PlacementTarget="{Binding ElementName=RepairButton}" Placement="Bottom">
+                <Button Width="175" Height="35" FontSize="16" Content="進階修復" Command="{Binding RepairOrCancelAsync}" CommandParameter="{x:Static local:MainViewModel+OperationMode.Full}"/>
+            </Popup>
         </StackPanel>
         <TextBox Margin="0,0,10,5" Width="175" FontSize="15" IsReadOnly="True" TextWrapping="Wrap" Text="{Binding LogView, Mode=OneWay}"/>
     </WrapPanel>
