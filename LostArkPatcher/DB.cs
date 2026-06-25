@@ -1,15 +1,15 @@
-﻿using System.Data;
+﻿using Microsoft.Data.Sqlite;
+using System.Data;
 using System.Data.Common;
-using System.Data.SQLite;
 using System.Text.RegularExpressions;
 
 namespace LostArkPatcher
 {
     internal partial class DB : IDisposable, IAsyncDisposable
     {
-        private partial class Table(SQLiteConnection dbConnection, string name, string? referentialSchema = null) : IDisposable, IAsyncDisposable
+        private partial class Table(SqliteConnection dbConnection, string name, string? referentialSchema = null) : IDisposable, IAsyncDisposable
         {
-            private readonly SQLiteCommand dbCommand = dbConnection.CreateCommand();
+            private readonly SqliteCommand dbCommand = dbConnection.CreateCommand();
             public readonly string name = name;
             private readonly string? referentialSchema = referentialSchema;
 
@@ -118,7 +118,7 @@ namespace LostArkPatcher
             }
         }
 
-        private readonly SQLiteConnection dbConnection;
+        private readonly SqliteConnection dbConnection;
 
         //sever
         private readonly Table? file_size = null;
@@ -133,9 +133,11 @@ namespace LostArkPatcher
 
         public DB(string path_localDB, string? path_serverDB = null)
         {
-            dbConnection = new($"Data Source={path_localDB}");
+            dbConnection = new($"Data Source={path_localDB};Pooling=False");
             dbConnection.Open();
-            using SQLiteCommand dbCommand = dbConnection.CreateCommand();
+            using SqliteCommand dbCommand = dbConnection.CreateCommand();
+            dbCommand.CommandText = "PRAGMA journal_mode=WAL";
+            dbCommand.ExecuteNonQuery();
 
             if (path_serverDB is not null)
             {
@@ -145,6 +147,7 @@ namespace LostArkPatcher
                 dbCommand.CommandText = $"ATTACH DATABASE @path AS {TEMP_SERVERDB}";
                 dbCommand.Parameters.AddWithValue("@path", path_serverDB);
                 dbCommand.ExecuteNonQuery();
+                dbCommand.Parameters.Clear();
 
                 file_size = new(dbConnection, $"{TEMP_SERVERDB}.file_size");
 
@@ -208,7 +211,7 @@ namespace LostArkPatcher
             if (!await local_info.ExistsAsync())
                 return null;
             object? version = await local_info.SelectScalarAsync("key='version'", "value").ConfigureAwait(false);
-            if (version is null || DBNull.Value.Equals(version))
+            if (version is null || version == DBNull.Value)
                 return null;
             else
                 return Convert.ToInt32(version);
@@ -221,7 +224,7 @@ namespace LostArkPatcher
                 throw new InvalidOperationException("Server DB is not attched.");
 
             object? _version;
-            SQLiteCommand dbCommand = dbConnection.CreateCommand();
+            SqliteCommand dbCommand = dbConnection.CreateCommand();
             await using (dbCommand.ConfigureAwait(false))
             {
                 dbCommand.CommandText = SQL.Row.LeftJoin(
@@ -276,7 +279,7 @@ namespace LostArkPatcher
             if (fileInfo is null)
                 throw new InvalidOperationException("Server DB is not attched.");
 
-            SQLiteCommand dbCommand = dbConnection.CreateCommand();
+            SqliteCommand dbCommand = dbConnection.CreateCommand();
             await using (dbCommand.ConfigureAwait(false))
             {
                 dbCommand.CommandText = SQL.Row.CountQuery(
@@ -354,38 +357,13 @@ namespace LostArkPatcher
             PeriodicProgressReporter? progressReporter = null;
             if (progress is not null)
                 progressReporter = new(0.5, progress);
-            SQLiteCommand dbCommand = dbConnection.CreateCommand();
+            SqliteCommand dbCommand = dbConnection.CreateCommand();
             await using (dbCommand.ConfigureAwait(false))
             {
                 progressReporter?.SetStageTarget(0f, 1f);
                 await pending_changes.DeleteAsync().ConfigureAwait(false);
                 uint updatingCount = 0;
                 ConcurrentExclusiveSchedulerPair schedulerPair = new(TaskScheduler.Default);
-
-                SQLiteCommand dbCommand_delta = new(
-                    SQL.Row.Select(
-                        file_size.name,
-                        "id = @id and org_ver = @org_ver",
-                        "max(new_ver)"
-                    ),
-                    dbConnection
-                );
-                SQLiteCommand dbCommand_after = new(
-                    SQL.Row.Select(
-                        fileInfo.name,
-                        "id = @id and version = @version",
-                        "size, hash"
-                    ),
-                    dbConnection
-                );
-                SQLiteCommand dbCommand_update = new(
-                    SQL.Row.Replace(
-                        pending_changes.name,
-                        "unique_path, version, size, hash, property",
-                        "@unique_path, @version, @size, @hash, @property"
-                    ),
-                    dbConnection
-                );
 
                 string sqlUpdatableFiles = SQL.Row.QueryLeftJoin(
                         SQL.Row.GroupQuery(
@@ -406,110 +384,149 @@ namespace LostArkPatcher
                 if (totalCount == 0)
                     return (0, 0);
                 int doneCount = 0;
-                dbCommand.CommandText = sqlUpdatableFiles;
-                DbDataReader reader_updatable = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
-                await using (reader_updatable.ConfigureAwait(false))
-                await using (dbCommand_delta.ConfigureAwait(false))
-                await using (dbCommand_after.ConfigureAwait(false))
-                await using (dbCommand_update.ConfigureAwait(false))
+                await using (SqliteTransaction transaction = dbConnection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
-                    foreach (IDataRecord row in reader_updatable)
+                    dbCommand.Transaction = transaction;
+                    dbCommand.CommandText = sqlUpdatableFiles;
+                    DbDataReader reader_updatable = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
+
+                    SqliteCommand dbCommand_delta = new(
+                        SQL.Row.Select(
+                            file_size.name,
+                            "id = @id and org_ver = @org_ver",
+                            "max(new_ver)"
+                        ),
+                        dbConnection
+                    );
+                    SqliteCommand dbCommand_after = new(
+                        SQL.Row.Select(
+                            fileInfo.name,
+                            "id = @id and version = @version",
+                            "size, hash"
+                        ),
+                        dbConnection
+                    );
+                    SqliteCommand dbCommand_update = new(
+                        SQL.Row.Replace(
+                            pending_changes.name,
+                            "unique_path, version, size, hash, property",
+                            "@unique_path, @version, @size, @hash, @property"
+                        ),
+                        dbConnection
+                    );
+                    await using (reader_updatable.ConfigureAwait(false))
+                    await using (dbCommand_delta.ConfigureAwait(false))
+                    await using (dbCommand_after.ConfigureAwait(false))
+                    await using (dbCommand_update.ConfigureAwait(false))
                     {
-                        if (cancelToken.IsCancellationRequested)
-                            break;
-
-                        int id = Convert.ToInt32(row["id"]);
-                        string unique_path = Convert.ToString(row["unique_path"]);
-                        string path = Convert.ToString(row["path"]);
-                        object _version = row["version"];
-                        int version = _version == DBNull.Value ? -1 : Convert.ToInt32(_version);
-                        int property = Convert.ToInt32(row["property"]);
-
-                        List<DeltaInfo> sequence = new();
-
-                        //Find update steps
-                        int fromVersion = version;
-                        while (true)
+                        dbCommand_delta.Transaction = transaction;
+                        dbCommand_after.Transaction = transaction;
+                        dbCommand_update.Transaction = transaction;
+                        foreach (IDataRecord row in reader_updatable)
                         {
                             if (cancelToken.IsCancellationRequested)
                                 break;
 
-                            //Any version should be able to update to the latest version, so just choose the newest possible version as the next version
-                            dbCommand_delta.Parameters.AddWithValue("@id", id);
-                            dbCommand_delta.Parameters.AddWithValue("@org_ver", fromVersion);
-                            object? _toVersion = await dbCommand_delta.ExecuteScalarAsync().ConfigureAwait(false);
-                            if (_toVersion is null || _toVersion == DBNull.Value)
-                                break;
-                            int toVersion = Convert.ToInt32(_toVersion);
-                            sequence.Add(new()
+                            int id = Convert.ToInt32(row["id"]);
+                            string unique_path = Convert.ToString(row["unique_path"]);
+                            string path = Convert.ToString(row["path"]);
+                            object _version = row["version"];
+                            int version = _version == DBNull.Value ? -1 : Convert.ToInt32(_version);
+                            int property = Convert.ToInt32(row["property"]);
+
+                            List<DeltaInfo> sequence = new();
+
+                            //Find update steps
+                            int fromVersion = version;
+                            while (true)
                             {
-                                fromVersion = fromVersion == -1 ? null : fromVersion,
-                                toVersion = toVersion
-                            });
+                                if (cancelToken.IsCancellationRequested)
+                                    break;
 
-                            fromVersion = toVersion;
-                        }
+                                //Any version should be able to update to the latest version, so just choose the newest possible version as the next version
+                                dbCommand_delta.Parameters.AddWithValue("@id", id);
+                                dbCommand_delta.Parameters.AddWithValue("@org_ver", fromVersion);
+                                object? _toVersion = await dbCommand_delta.ExecuteScalarAsync().ConfigureAwait(false);
+                                dbCommand_delta.Parameters.Clear();
+                                if (_toVersion is null || _toVersion == DBNull.Value)
+                                    break;
+                                int toVersion = Convert.ToInt32(_toVersion);
+                                sequence.Add(new()
+                                {
+                                    fromVersion = fromVersion == -1 ? null : fromVersion,
+                                    toVersion = toVersion
+                                });
 
-                        if (cancelToken.IsCancellationRequested)
-                            break;
+                                fromVersion = toVersion;
+                            }
 
-                        //Update
-                        if (sequence.Count == 0)
-                            Interlocked.Increment(ref failed);
-                        else
-                        {
-                            Interlocked.Increment(ref updatingCount);
+                            if (cancelToken.IsCancellationRequested)
+                                break;
+
+                            //Update
+                            if (sequence.Count == 0)
+                                Interlocked.Increment(ref failed);
+                            else
+                            {
+                                Interlocked.Increment(ref updatingCount);
 #pragma warning disable CS4014
-                            UpdateFileAsync(
-                                new()
-                                {
-                                    id = id,
-                                    relativePath = path,
-                                    sequence = new(sequence) //sequence will be used later and shouldn't be modified
-                                },
-                                cancelToken
-                            )
-                            .ContinueWith(async (preTask) => {
-                                try
-                                {
-                                    int? afterVersion = preTask.Result;
-                                    if (afterVersion is null)
-                                        Interlocked.Increment(ref failed);
-                                    else
+                                UpdateFileAsync(
+                                    new()
                                     {
-                                        dbCommand_after.Parameters.AddWithValue("@id", id);
-                                        dbCommand_after.Parameters.AddWithValue("@version", afterVersion);
-                                        using DbDataReader reader_after = await dbCommand_after.ExecuteReaderAsync().ConfigureAwait(false);
-                                        if (!await reader_after.ReadAsync().ConfigureAwait(false))
+                                        id = id,
+                                        relativePath = path,
+                                        sequence = new(sequence) //sequence will be used later and shouldn't be modified
+                                    },
+                                    cancelToken
+                                )
+                                .ContinueWith(async (preTask) => {
+                                    try
+                                    {
+                                        int? afterVersion = preTask.Result;
+                                        if (afterVersion is null)
                                             Interlocked.Increment(ref failed);
                                         else
                                         {
-                                            dbCommand_update.Parameters.AddWithValue("@unique_path", unique_path);
-                                            dbCommand_update.Parameters.AddWithValue("@version", afterVersion);
-                                            dbCommand_update.Parameters.AddWithValue("@size", Convert.ToInt32(reader_after["size"]));
-                                            dbCommand_update.Parameters.AddWithValue("@hash", Convert.ToString(reader_after["hash"]));
-                                            dbCommand_update.Parameters.AddWithValue("@property", property);
-                                            await dbCommand_update.ExecuteNonQueryAsync().ConfigureAwait(false);
+                                            dbCommand_after.Parameters.AddWithValue("@id", id);
+                                            dbCommand_after.Parameters.AddWithValue("@version", afterVersion);
+                                            await using (DbDataReader reader_after = await dbCommand_after.ExecuteReaderAsync().ConfigureAwait(false))
+                                            {
+                                                if (!await reader_after.ReadAsync().ConfigureAwait(false))
+                                                    Interlocked.Increment(ref failed);
+                                                else
+                                                {
+                                                    dbCommand_update.Parameters.AddWithValue("@unique_path", unique_path);
+                                                    dbCommand_update.Parameters.AddWithValue("@version", afterVersion);
+                                                    dbCommand_update.Parameters.AddWithValue("@size", Convert.ToInt32(reader_after["size"]));
+                                                    dbCommand_update.Parameters.AddWithValue("@hash", Convert.ToString(reader_after["hash"]));
+                                                    dbCommand_update.Parameters.AddWithValue("@property", property);
+                                                    await dbCommand_update.ExecuteNonQueryAsync().ConfigureAwait(false);
+                                                    dbCommand_update.Parameters.Clear();
 
-                                            if (afterVersion == sequence.Last().toVersion)
-                                                Interlocked.Increment(ref updated);
-                                            else
-                                                Interlocked.Increment(ref failed);
+                                                    if (afterVersion == sequence.Last().toVersion)
+                                                        Interlocked.Increment(ref updated);
+                                                    else
+                                                        Interlocked.Increment(ref failed);
+                                                }
+                                            }
+                                            dbCommand_after.Parameters.Clear();
                                         }
                                     }
-                                }
-                                finally
-                                {
-                                    progressReporter?.SetStageRatio((float)Interlocked.Increment(ref doneCount) / totalCount);
-                                    Interlocked.Decrement(ref updatingCount);
-                                }
-                            }, schedulerPair.ExclusiveScheduler);
+                                    finally
+                                    {
+                                        progressReporter?.SetStageRatio((float)Interlocked.Increment(ref doneCount) / totalCount);
+                                        Interlocked.Decrement(ref updatingCount);
+                                    }
+                                }, schedulerPair.ExclusiveScheduler);
 #pragma warning restore CS4014
+                            }
                         }
-                    }
 
-                    while (updatingCount > 0)
-                        await Task.Delay(500).ConfigureAwait(false);
+                        while (updatingCount > 0)
+                            await Task.Delay(500).ConfigureAwait(false);
+                    }
+                    transaction.Commit();
+                    dbCommand.Transaction = null;
                 }
                 progressReporter?.SetStageTarget(1f, 0f);
 
@@ -538,7 +555,7 @@ namespace LostArkPatcher
                 throw new InvalidOperationException("Server DB is not attched.");
 
             int deleted = 0, inserted = 0;
-            SQLiteCommand dbCommand = dbConnection.CreateCommand();
+            SqliteCommand dbCommand = dbConnection.CreateCommand();
             await using (dbCommand.ConfigureAwait(false))
             {
                 dbCommand.CommandText = SQL.Row.DeleteInQuery(
@@ -593,20 +610,12 @@ namespace LostArkPatcher
             if (progress is not null)
                 progressReporter = new(0.5, progress);
             int totalCount, doneCount;
-            SQLiteCommand dbCommand = dbConnection.CreateCommand();
+            SqliteCommand dbCommand = dbConnection.CreateCommand();
             await using (dbCommand.ConfigureAwait(false))
             {
                 //Update size in all entries
                 progressReporter?.SetStageTarget(0, 0.05f);
                 await pending_changes.DeleteAsync().ConfigureAwait(false);
-                SQLiteCommand dbCommand_size = new(
-                    SQL.Row.Replace(
-                        pending_changes.name,
-                        "unique_path, size",
-                        "@unique_path, @size"
-                    ),
-                    dbConnection
-                );
                 string sqlAllSizes = SQL.Row.Select(
                     file_version.name,
                     null,
@@ -615,29 +624,45 @@ namespace LostArkPatcher
                 dbCommand.CommandText = SQL.Row.CountQuery(sqlAllSizes);
                 totalCount = Convert.ToInt32(await dbCommand.ExecuteScalarAsync().ConfigureAwait(false));
                 doneCount = 0;
-                dbCommand.CommandText = sqlAllSizes;
-                DbDataReader reader_size = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
-                await using (reader_size.ConfigureAwait(false))
-                await using (dbCommand_size.ConfigureAwait(false))
+                await using (SqliteTransaction transaction = dbConnection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
-                    foreach (IDataRecord row in reader_size)
+                    dbCommand.Transaction = transaction;
+                    dbCommand.CommandText = sqlAllSizes;
+                    DbDataReader reader_size = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
+                    SqliteCommand dbCommand_size = new(
+                        SQL.Row.Replace(
+                            pending_changes.name,
+                            "unique_path, size",
+                            "@unique_path, @size"
+                        ),
+                        dbConnection
+                    );
+                    await using (reader_size.ConfigureAwait(false))
+                    await using (dbCommand_size.ConfigureAwait(false))
                     {
-                        if (cancelToken.IsCancellationRequested)
-                            break;
-
-                        string unique_path = Convert.ToString(row["unique_path"]);
-                        object _size = row["size"];
-                        int? size = _size == DBNull.Value ? null : Convert.ToInt32(_size);
-
-                        long diskSize = GetFileSize(unique_path);
-                        if (size != diskSize)
+                        dbCommand_size.Transaction = transaction;
+                        foreach (IDataRecord row in reader_size)
                         {
-                            dbCommand_size.Parameters.AddWithValue("@unique_path", unique_path);
-                            dbCommand_size.Parameters.AddWithValue("@size", diskSize < 0 ? null : diskSize);
-                            await dbCommand_size.ExecuteNonQueryAsync().ConfigureAwait(false);
+                            if (cancelToken.IsCancellationRequested)
+                                break;
+
+                            string unique_path = Convert.ToString(row["unique_path"]);
+                            object _size = row["size"];
+                            int? size = _size == DBNull.Value ? null : Convert.ToInt32(_size);
+
+                            long diskSize = GetFileSize(unique_path);
+                            if (size != diskSize)
+                            {
+                                dbCommand_size.Parameters.AddWithValue("@unique_path", unique_path);
+                                dbCommand_size.Parameters.AddWithValue("@size", diskSize < 0 ? DBNull.Value : diskSize);
+                                await dbCommand_size.ExecuteNonQueryAsync().ConfigureAwait(false);
+                                dbCommand_size.Parameters.Clear();
+                            }
+                            progressReporter?.SetStageRatio((float)++doneCount / totalCount);
                         }
-                        progressReporter?.SetStageRatio((float)++doneCount / totalCount);
                     }
+                    transaction.Commit();
+                    dbCommand.Transaction = null;
                 }
                 if (cancelToken.IsCancellationRequested)
                 {
@@ -931,19 +956,13 @@ namespace LostArkPatcher
                     }
                 }
 
-                //here: every row in 'pending_changes' has either all columns not null (for simple update) or only 'unique_path' not null (for hashing)
+                //here: every row in 'pending_changes' has
+                //1. all columns not null (for simple update)
+                //2. only 'unique_path' not null (for hashing)
 
                 //Calculate the file hash:
                 uint hashingCount = 0;
                 ConcurrentExclusiveSchedulerPair schedulerPair = new(TaskScheduler.Default);
-                SQLiteCommand dbCommand_hash = new(
-                    SQL.Row.Replace(
-                        pending_changes.name,
-                        "unique_path, hash",
-                        "@unique_path, @hash"
-                    ),
-                    dbConnection
-                );
                 string sqlAllPending = SQL.Row.Select(
                     pending_changes.name,
                     "hash is null"
@@ -951,42 +970,58 @@ namespace LostArkPatcher
                 dbCommand.CommandText = SQL.Row.CountQuery(sqlAllPending);
                 totalCount = Convert.ToInt32(await dbCommand.ExecuteScalarAsync().ConfigureAwait(false));
                 doneCount = 0;
-                dbCommand.CommandText = sqlAllPending;
-                DbDataReader reader_hash = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
-                await using (reader_hash.ConfigureAwait(false))
-                await using (dbCommand_hash.ConfigureAwait(false))
+                await using (SqliteTransaction transaction = dbConnection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
-                    foreach (IDataRecord row in reader_hash)
+                    dbCommand.Transaction = transaction;
+                    dbCommand.CommandText = sqlAllPending;
+                    DbDataReader reader_hash = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
+                    SqliteCommand dbCommand_hash = new(
+                        SQL.Row.Replace(
+                            pending_changes.name,
+                            "unique_path, hash",
+                            "@unique_path, @hash"
+                        ),
+                        dbConnection
+                    );
+                    await using (reader_hash.ConfigureAwait(false))
+                    await using (dbCommand_hash.ConfigureAwait(false))
                     {
-                        if (cancelToken.IsCancellationRequested)
-                            break;
+                        dbCommand_hash.Transaction = transaction;
+                        foreach (IDataRecord row in reader_hash)
+                        {
+                            if (cancelToken.IsCancellationRequested)
+                                break;
 
-                        string unique_path = Convert.ToString(row["unique_path"]);
-                        Interlocked.Increment(ref hashingCount);
+                            string unique_path = Convert.ToString(row["unique_path"]);
+                            Interlocked.Increment(ref hashingCount);
 #pragma warning disable CS4014
-                        HashFileAsync(unique_path, cancelToken)
-                        .ContinueWith(async (preTask) => {
-                            try
-                            {
-                                string? hash = preTask.Result;
-                                if (hash is not null)
+                            HashFileAsync(unique_path, cancelToken)
+                            .ContinueWith(async (preTask) => {
+                                try
                                 {
-                                    dbCommand_hash.Parameters.AddWithValue("@unique_path", unique_path);
-                                    dbCommand_hash.Parameters.AddWithValue("@hash", hash);
-                                    await dbCommand_hash.ExecuteNonQueryAsync().ConfigureAwait(false);
+                                    string? hash = preTask.Result;
+                                    if (hash is not null)
+                                    {
+                                        dbCommand_hash.Parameters.AddWithValue("@unique_path", unique_path);
+                                        dbCommand_hash.Parameters.AddWithValue("@hash", hash);
+                                        await dbCommand_hash.ExecuteNonQueryAsync().ConfigureAwait(false);
+                                        dbCommand_hash.Parameters.Clear();
+                                    }
                                 }
-                            }
-                            finally
-                            {
-                                progressReporter?.SetStageRatio((float)Interlocked.Increment(ref doneCount) / totalCount);
-                                Interlocked.Decrement(ref hashingCount);
-                            }
-                        }, schedulerPair.ExclusiveScheduler);
+                                finally
+                                {
+                                    progressReporter?.SetStageRatio((float)Interlocked.Increment(ref doneCount) / totalCount);
+                                    Interlocked.Decrement(ref hashingCount);
+                                }
+                            }, schedulerPair.ExclusiveScheduler);
 #pragma warning restore CS4014
+                        }
                     }
 
                     while (hashingCount > 0)
                         await Task.Delay(500).ConfigureAwait(false);
+                    transaction.Commit();
+                    dbCommand.Transaction = null;
                 }
                 progressReporter?.SetStageTarget(0.95f, 0.02f);
 

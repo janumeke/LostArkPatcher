@@ -48,14 +48,14 @@ namespace LostArkPatcher
             maxDecompressingThreads = new(coresToUse, coresToUse);
         }
 
-        private const string tempDirectory = ".patcher", registryFile = "dict";
+        private const string TEMPDIRECTORY = ".patcher", REGISTRYFILENAME = "dict";
 
         private static ConcurrentDictionary<(int id, int? fromVersion, int toVersion), string>? registry;
 
         //Should be called before updating
         private static void LoadUpdatingCache()
         {
-            List<GameFileEntry>? _registry = FS.LoadGameFileRegistry(gamePath + tempDirectory + Path.DirectorySeparatorChar + registryFile);
+            List<GameFileEntry>? _registry = FS.LoadGameFileRegistry(gamePath + TEMPDIRECTORY + Path.DirectorySeparatorChar + REGISTRYFILENAME);
             registry = new();
             if (_registry is not null)
                 foreach(GameFileEntry entry in _registry)
@@ -65,14 +65,11 @@ namespace LostArkPatcher
         //Should be called after updating
         private static void SaveUpdatingCache()
         {
+            string path = gamePath + TEMPDIRECTORY + Path.DirectorySeparatorChar + REGISTRYFILENAME;
             if (registry is not null && !registry.IsEmpty)
-                FS.SaveGameFileRegistry(registry, gamePath + tempDirectory + Path.DirectorySeparatorChar + registryFile);
+                FS.SaveGameFileRegistry(registry, path);
             else
-                try
-                {
-                    File.Delete(gamePath + tempDirectory + Path.DirectorySeparatorChar + registryFile);
-                }
-                catch { }
+                try { File.Delete(path); } catch { }
         }
 
         // out: the version in the end, or null if unchanged
@@ -102,10 +99,10 @@ namespace LostArkPatcher
                 return await Task.Run<int?>(async () => {
                     string? path;
                     if (registry is not null && registry.TryRemove((info.id, null, info.sequence.Last().toVersion), out path)
-                        && File.Exists(gamePath + tempDirectory + Path.DirectorySeparatorChar + path))
-                        path = gamePath + tempDirectory + Path.DirectorySeparatorChar + path;
+                        && File.Exists(gamePath + TEMPDIRECTORY + Path.DirectorySeparatorChar + path))
+                        path = gamePath + TEMPDIRECTORY + Path.DirectorySeparatorChar + path;
                     else
-                        path = await FS.DownloadGameFileAsync(info.id, info.sequence.Last().toVersion, null, gamePath + tempDirectory + Path.DirectorySeparatorChar, cancelToken).ConfigureAwait(false);
+                        path = await FS.DownloadGameFileAsync(info.id, info.sequence.Last().toVersion, null, gamePath + TEMPDIRECTORY + Path.DirectorySeparatorChar, cancelToken).ConfigureAwait(false);
                     maxDownloadingThreads.Release();
                     if (path is null)
                         return null;
@@ -172,10 +169,10 @@ namespace LostArkPatcher
                     lastVersionTask = Task.Run<int?>(async () => {
                         string? path;
                         if (registry is not null && registry.TryRemove((info.id, delta.fromVersion, delta.toVersion), out path)
-                            && File.Exists(gamePath + tempDirectory + Path.DirectorySeparatorChar + path))
-                            path = gamePath + tempDirectory + Path.DirectorySeparatorChar + path;
+                            && File.Exists(gamePath + TEMPDIRECTORY + Path.DirectorySeparatorChar + path))
+                            path = gamePath + TEMPDIRECTORY + Path.DirectorySeparatorChar + path;
                         else
-                            path = await FS.DownloadGameFileAsync(info.id, delta.toVersion, delta.fromVersion, gamePath + tempDirectory + Path.DirectorySeparatorChar, cancelToken).ConfigureAwait(false);
+                            path = await FS.DownloadGameFileAsync(info.id, delta.toVersion, delta.fromVersion, gamePath + TEMPDIRECTORY + Path.DirectorySeparatorChar, cancelToken).ConfigureAwait(false);
                         maxDownloadingThreads.Release();
                         if (path is null)
                             if (preVersionTask is not null)
@@ -264,7 +261,7 @@ namespace LostArkPatcher
             }
             finally
             {
-                try { Directory.Delete(gamePath + tempDirectory); } catch { }
+                try { Directory.Delete(gamePath + TEMPDIRECTORY); } catch { }
             }
         }
         #endregion
@@ -360,7 +357,7 @@ namespace LostArkPatcher
                 return null;
             else
             {
-                using DB db = new(localDBPath);
+                await using DB db = new(localDBPath);
                 //SQLite doesn't support asynchronous operations
                 return await Task.Run(() => db.GetVersionAsync());
             }

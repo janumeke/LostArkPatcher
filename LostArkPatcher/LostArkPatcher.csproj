@@ -11,28 +11,17 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="DBContext\**" />
-    <EmbeddedResource Remove="DBContext\**" />
-    <None Remove="DBContext\**" />
-    <Page Remove="DBContext\**" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <None Remove="DB.cs~RF14d41d7.TMP" />
-  </ItemGroup>
-
-  <ItemGroup>
     <Content Include="Resources\LA.ico" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <PackageReference Include="Ecng.Lzma" Version="1.0.65" />
-    <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" Version="3.0.1" />
-    <PackageReference Include="SharpCompress" Version="0.49.1" />
-    <PackageReference Include="System.Data.SQLite.Core" Version="1.0.119" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
+    <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" Version="2.3.2" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.3" />
     <PackageReference Include="System.Management" Version="10.0.9" />
-    <PackageReference Include="VCDiff" Version="5.0.0" />
+    <PackageReference Include="VCDiff" Version="4.0.1" />
   </ItemGroup>
 
   <ItemGroup>

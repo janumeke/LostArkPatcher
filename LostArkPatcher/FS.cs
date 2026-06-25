@@ -407,6 +407,9 @@ namespace LostArkPatcher
         /// </remarks>
         public static List<GameFileEntry>? LoadGameFileRegistry(string path)
         {
+            if (!File.Exists(path))
+                return null;
+
             try
             {
                 using FileStream fs = File.Open(path, FileMode.Open);
