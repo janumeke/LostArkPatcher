@@ -451,7 +451,12 @@
 
             static public string Create(string table, string schema)
             {
-                return $"CREATE TABLE {table} ({schema})";
+                return $"create table {table} ({schema})";
+            }
+
+            static public string CreateTemp(string table, string schema)
+            {
+                return $"create temporary table {table} ({schema})";
             }
 
             static public string CreateTempAsQuery(string asSubSQL, string tempTable)

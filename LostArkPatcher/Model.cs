@@ -5,9 +5,9 @@ using System.Security.Cryptography;
 
 namespace LostArkPatcher
 {
-    internal static class Model
+    public  static class Model
     {
-        //Should be set before preparations for updating or repairing
+        //Should be set before preparations for updating or repairing and not modified during updating or repairing
         private static string gamePath;
         private static FS.DiskType diskType;
 
@@ -243,6 +243,7 @@ namespace LostArkPatcher
             }
         }
 
+        /// <remarks>Thread-unsafe.</remarks>
         public static async Task<(int updated, int failed)> UpdateGameFilesAsync(string gamePath, string serverDBPath, CancellationToken cancelToken, IProgress<float>? progress = null)
         {
             try
@@ -298,7 +299,7 @@ namespace LostArkPatcher
         }
 
         // in: relative path, case-insensitive (ok for windows system)
-        // out: md5 in lower-case or null if non-existent
+        // out: md5 in lower-case or null if non-existent or denied access
         private static async Task<string?> HashFileAsync(string relativePath, CancellationToken cancelToken)
         {
             if(maxHashingThreads is null)
@@ -321,20 +322,39 @@ namespace LostArkPatcher
                 maxHashingThreads.Release();
             }
         }
+        public enum RepairMode
+        {
+            Quick,
+            LastVersion,
+            Full
+        }
 
-        public static async Task<(int deleted, int modified)> RepairGameFileEntriesAsync(string gamePath, string serverDBPath, bool fully, CancellationToken cancelToken, IProgress<float>? progress = null)
+        /// <remarks>Thread-unsafe.</remarks>
+        public static async Task<(int deleted, int modified, bool someAccessesDenied)> RepairGameFileEntriesAsync(string gamePath, string serverDBPath, RepairMode mode, CancellationToken cancelToken, IProgress<float>? progress = null)
         {
             await using DB db = new(gamePath + LOCALDB_FILENAME, serverDBPath);
             Model.gamePath = gamePath;
             Model.diskType = FS.GetDiskType(gamePath) ?? FS.DiskType.HDD;
             SetHashingLimitations();
+            DateTime? hashAfter = null;
+            if(mode == RepairMode.LastVersion)
+            {
+                int? version = await db.GetFileMaxVersionAsync();
+                if(version is not null)
+                {
+                    DateTime? date = await db.GetVersionDateAsync((int)version);
+                    if (date is not null)
+                        hashAfter = date;
+                }
+            }
             //SQLite doesn't support asynchronous operations
-            (int deleted, int modified) = await Task.Run(() => db.FixFileInfosAsync((relativePath) => {
-                return FS.GetFileSize(gamePath + relativePath);
-            }, HashFileAsync, cancelToken, progress, fully));
+            (int deleted, int modified, bool someAccessesDenied) = await Task.Run(() => db.FixFileInfosAsync((relativePath) => {
+                try { return new FileInfo(gamePath + relativePath); }
+                catch { return null; }
+            }, HashFileAsync, cancelToken, progress, mode != RepairMode.Full, hashAfter));
             //SQLite doesn't support asynchronous operations
             await Task.Run(() => db.FixVersionAsync());
-            return (deleted, modified);
+            return (deleted, modified, someAccessesDenied);
         }
         #endregion
 
@@ -364,7 +384,6 @@ namespace LostArkPatcher
         }
 
         public static string? LauncherInstallerUrl { get; private set; } = null;
-        public static string? ServerDBArchiveUrl { get; private set; } = null;
 
         public static async Task<string?> GetLauncherLatestVersionAsync()
         {
@@ -373,11 +392,36 @@ namespace LostArkPatcher
             return launcherInfo.latestVersion;
         }
 
+        private static string? serverDBArchiveUrl = null;
+
         public static async Task<string?> GetGameLatestVersionAsync()
         {
             var gameInfo = await FS.RetrieveGameFilesInfoAsync(CancellationToken.None);
-            ServerDBArchiveUrl = gameInfo.serverDBArchiveUrl;
+            serverDBArchiveUrl = gameInfo.serverDBArchiveUrl;
             return gameInfo.latestVersion;
+        }
+
+        /// <remarks>Don't modify the file there.</remarks>
+        public static string? CachedServerDBPath { get; private set; } = null;
+
+        public static async Task CacheServerDB()
+        {
+            if (serverDBArchiveUrl is null)
+            {
+                await GetGameLatestVersionAsync();
+                if (serverDBArchiveUrl is null)
+                    return;
+            }
+            CachedServerDBPath = await FS.DownloadServerDBAsync(serverDBArchiveUrl, null, CancellationToken.None);
+        }
+
+        public static void CleanUp()
+        {
+            try
+            {
+                File.Delete(CachedServerDBPath);
+            }
+            catch { }
         }
     }
 }

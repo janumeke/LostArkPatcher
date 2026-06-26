@@ -1,6 +1,8 @@
 ﻿using Microsoft.Data.Sqlite;
 using System.Data;
 using System.Data.Common;
+using System.Globalization;
+using System.IO;
 using System.Text.RegularExpressions;
 
 namespace LostArkPatcher
@@ -123,69 +125,72 @@ namespace LostArkPatcher
         //sever
         private readonly Table? file_size = null;
         private readonly Table? fileInfo = null;
+        private readonly Table? version_info = null;
 
         //local
         private readonly Table local_info;
         private readonly Table file_version;
-
-        //in-memory
         private readonly Table pending_changes;
 
         public DB(string path_localDB, string? path_serverDB = null)
         {
-            dbConnection = new($"Data Source={path_localDB};Pooling=False");
+            dbConnection = new($"Data Source=file:{path_localDB};Pooling=False");
             dbConnection.Open();
             using SqliteCommand dbCommand = dbConnection.CreateCommand();
-            dbCommand.CommandText = "PRAGMA journal_mode=WAL";
+            dbCommand.CommandText = "PRAGMA journal_mode = WAL";
+            dbCommand.ExecuteNonQuery();
+            dbCommand.CommandText = $"PRAGMA temp_store = MEMORY";
             dbCommand.ExecuteNonQuery();
 
             if (path_serverDB is not null)
             {
-                const string TEMP_SERVERDB = "serverdb";
-                const string TEMP_INFOVERSION = "file_infoversion";
+                const string SERVERDB = "serverdb";
+                const string INFOVERSION = "file_infoversion";
 
-                dbCommand.CommandText = $"ATTACH DATABASE @path AS {TEMP_SERVERDB}";
-                dbCommand.Parameters.AddWithValue("@path", path_serverDB);
+                dbCommand.CommandText = $"ATTACH DATABASE @path AS {SERVERDB}";
+                dbCommand.Parameters.AddWithValue("@path", $"file:{path_serverDB}?mode=ro");
                 dbCommand.ExecuteNonQuery();
                 dbCommand.Parameters.Clear();
 
-                file_size = new(dbConnection, $"{TEMP_SERVERDB}.file_size");
+                file_size = new(dbConnection, $"{SERVERDB}.file_size");
 
                 dbCommand.CommandText = SQL.Table.CreateTempAsQuery(
                     SQL.Row.Join(
-                        $"{TEMP_SERVERDB}.file_info",
-                        $"{TEMP_SERVERDB}.file_version",
+                        $"{SERVERDB}.file_info",
+                        $"{SERVERDB}.file_version",
                         "left.id = right.id",
                         null,
                         "left.id, unique_path, path, version, size, hash, property"
                     ),
-                    TEMP_INFOVERSION
+                    INFOVERSION
                 );
                 dbCommand.ExecuteNonQuery();
-                fileInfo = new(dbConnection, TEMP_INFOVERSION);
+                fileInfo = new(dbConnection, INFOVERSION);
+
+                version_info = new(dbConnection, $"{SERVERDB}.version_info");
             }
 
             local_info = new(dbConnection, "local_info", "key text primary key, value integer");
             file_version = new(dbConnection, "file_version", "unique_path text primary key, version integer, size integer, hash text, property integer");
 
-            const string TEMP_INMENORYDB = "inmemorydb";
-            const string TEMP_PENDINGCHANGES = "pending_changes";
-            dbCommand.CommandText = $"ATTACH DATABASE ':memory:' AS {TEMP_INMENORYDB}";
-            dbCommand.ExecuteNonQuery();
-            pending_changes = new(dbConnection, $"{TEMP_INMENORYDB}.{TEMP_PENDINGCHANGES}", @"
+            const string PENDINGCHANGES = "pending_changes";
+            dbCommand.CommandText = SQL.Table.CreateTemp(PENDINGCHANGES, @"
                 unique_path text primary key,
                 version integer,
                 size integer,
                 hash text,
-                property integer
+                property integer,
+                last_modified integer
             ");
-            pending_changes.CreateAsync().Wait();
+            dbCommand.ExecuteNonQuery();
+            pending_changes = new(dbConnection, PENDINGCHANGES);
         }
 
         public void Dispose()
         {
             file_size?.Dispose();
             fileInfo?.Dispose();
+            version_info?.Dispose();
             local_info.Dispose();
             file_version.Dispose();
             pending_changes.Dispose();
@@ -195,10 +200,12 @@ namespace LostArkPatcher
 
         public async ValueTask DisposeAsync()
         {
-            if(file_size is not null)
+            if (file_size is not null)
                 await file_size.DisposeAsync().ConfigureAwait(false);
             if (fileInfo is not null)
                 await fileInfo.DisposeAsync().ConfigureAwait(false);
+            if (version_info is not null)
+                await version_info.DisposeAsync().ConfigureAwait(false);
             await local_info.DisposeAsync().ConfigureAwait(false);
             await file_version.DisposeAsync().ConfigureAwait(false);
             await pending_changes.DisposeAsync().ConfigureAwait(false);
@@ -273,6 +280,32 @@ namespace LostArkPatcher
                 await file_version.CreateAsync().ConfigureAwait(false);
         }
 
+        public async Task<int?> GetFileMaxVersionAsync()
+        {
+            object? _version = await file_version.SelectScalarAsync(column: "max(version)");
+            if (_version is null || _version == DBNull.Value)
+                return null;
+            try { return Convert.ToInt32(_version); }
+            catch { return null; }
+        }
+
+        /// <exception cref="InvalidOperationException"/>
+        public async Task<DateTime?> GetVersionDateAsync(int version)
+        {
+            if (version_info is null)
+                throw new InvalidOperationException("Server DB is not attched.");
+
+            object? _date = await version_info.SelectScalarAsync(
+                $"version={version}",
+                "reg_date"
+            );
+            if (_date is null || _date == DBNull.Value)
+                return null;
+            //the datetime string looks more like UTC than KST.
+            try { return DateTime.ParseExact(Convert.ToString(_date), "yyyy-MM-dd HH:mm:ss", DateTimeFormatInfo.InvariantInfo, DateTimeStyles.AssumeUniversal); }
+            catch { return null; }
+        }
+
         /// <exception cref="InvalidOperationException"/>
         public async Task<int> GetOutdatedCountAsync()
         {
@@ -298,14 +331,31 @@ namespace LostArkPatcher
         private class PeriodicProgressReporter : IDisposable
         {
             private float previous = 0;
+            public float Previous {
+                get { return previous; }
+                set { Interlocked.Exchange(ref previous, value); }
+            }
+
             private float stage = 0;
+            public float Stage
+            {
+                get { return stage; }
+                set { Interlocked.Exchange(ref stage, value); }
+            }
+
             private float stageRatio = 0;
+            public float StageRatio
+            {
+                get { return stageRatio; }
+                set { Interlocked.Exchange(ref stageRatio, value); }
+            }
+
             readonly Timer timer;
 
             public PeriodicProgressReporter(double intervalSeconds, IProgress<float> progress)
             {
                 timer = new((_) => {
-                    progress.Report(previous + stageRatio * stage);
+                    progress.Report(Previous + StageRatio * Stage);
                 }, null, TimeSpan.Zero, TimeSpan.FromSeconds(intervalSeconds));
             }
 
@@ -314,16 +364,11 @@ namespace LostArkPatcher
                 timer.Dispose();
             }
 
-            public void SetStageTarget(float previous, float stage)
+            public void StartNextStage(float stage)
             {
-                Interlocked.Exchange(ref this.stageRatio, 0);
-                Interlocked.Exchange(ref this.stage, stage);
-                Interlocked.Exchange(ref this.previous, previous);
-            }
-
-            public void SetStageRatio(float stageRatio)
-            {
-                Interlocked.Exchange(ref this.stageRatio, stageRatio);
+                StageRatio = 0;
+                Previous = Previous + Stage;
+                Stage = stage;
             }
         }
 
@@ -360,7 +405,7 @@ namespace LostArkPatcher
             SqliteCommand dbCommand = dbConnection.CreateCommand();
             await using (dbCommand.ConfigureAwait(false))
             {
-                progressReporter?.SetStageTarget(0f, 1f);
+                progressReporter?.StartNextStage(1);
                 await pending_changes.DeleteAsync().ConfigureAwait(false);
                 uint updatingCount = 0;
                 ConcurrentExclusiveSchedulerPair schedulerPair = new(TaskScheduler.Default);
@@ -387,9 +432,9 @@ namespace LostArkPatcher
                 await using (SqliteTransaction transaction = dbConnection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
                     dbCommand.Transaction = transaction;
+
                     dbCommand.CommandText = sqlUpdatableFiles;
                     DbDataReader reader_updatable = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
-
                     SqliteCommand dbCommand_delta = new(
                         SQL.Row.Select(
                             file_size.name,
@@ -514,7 +559,8 @@ namespace LostArkPatcher
                                     }
                                     finally
                                     {
-                                        progressReporter?.SetStageRatio((float)Interlocked.Increment(ref doneCount) / totalCount);
+                                        if (progressReporter is not null)
+                                            progressReporter.StageRatio = (float)Interlocked.Increment(ref doneCount) / totalCount;
                                         Interlocked.Decrement(ref updatingCount);
                                     }
                                 }, schedulerPair.ExclusiveScheduler);
@@ -525,10 +571,11 @@ namespace LostArkPatcher
                         while (updatingCount > 0)
                             await Task.Delay(500).ConfigureAwait(false);
                     }
+
                     transaction.Commit();
                     dbCommand.Transaction = null;
                 }
-                progressReporter?.SetStageTarget(1f, 0f);
+                progressReporter?.StartNextStage(0);
 
                 dbCommand.CommandText = SQL.Row.ReplaceQuery(
                     file_version.name,
@@ -584,28 +631,32 @@ namespace LostArkPatcher
             return (deleted, inserted);
         }
 
-        /// <param name="GetFileSize">
+        /// <param name="GetFileInfo">
         /// <para>in: relative path, case-insensitive (ok for windows system)</para>
-        /// <para>out: size in bytes, or negative number if non-existent</para>
+        /// <para>out: a <c>FileInfo</c> object for the file or <c>null</c> if there is an error</para>
         /// </param>
         /// <param name="HashFileAsync">
         /// <para>in: relative path, case-insensitive (ok for windows system)</para>
-        /// <para>out: md5 in lower-case or <c>null</c> if non-existent</para>
+        /// <para>out: md5 in lower-case or <c>null</c> if non-existent or denied access</para>
         /// <remarks>Block the calling thread to stop the next file updating.</remarks>
         /// </param>
-        /// <param name="noGuessing">
-        /// <para>true: Hash every file whose size is at least in one entry in the server database.</para>
-        /// <para>false: Hash only files which cannot be guessed to be an entry in the server database.</para>
+        /// <param name="canGuess">
+        /// <para><c>true</c>: Hash only files which cannot be guessed to be an entry in the server database.</para>
+        /// <para><c>false</c>: Hash every file whose size is at least in one entry in the server database.</para>
+        /// </param>
+        /// <param name="hashAfter">
+        /// When <paramref name="canGuess"/> is <c>true</c>/<c>false</c>, also/only hash files last modified later than the time (inclusive, in seconds).
         /// </param>
         /// <exception cref="InvalidOperationException"/>
-        //Use actual size, version and hash of entry if possible, and actual hash if necessary to best guess which entry in the server db the file is
-        //Entries with missing or unknown files will be deleted
-        public async Task<(int deleted, int modified)> FixFileInfosAsync(Func<string, long> GetFileSize, Func<string, CancellationToken, Task<string?>> HashFileAsync, CancellationToken cancelToken, IProgress<float>? progress = null, bool noGuessing = false)
+        //Use actual size, version and hash of entry if possible, and actual hash if necessary to best guess which version in the server db the file is
+        //Entries with missing or unknown files will be deleted, but entries with files that can't be accessed are unchanged
+        public async Task<(int deleted, int modified, bool someAccessesDenied)> FixFileInfosAsync(Func<string, FileInfo?> GetFileInfo, Func<string, CancellationToken, Task<string?>> HashFileAsync, CancellationToken cancelToken, IProgress<float>? progress = null, bool canGuess = false, DateTime? hashAfter = null)
         {
             if (fileInfo is null)
                 throw new InvalidOperationException("Server DB is not attched.");
 
             int deleted = 0, modified = 0;
+            bool someAccessesDenied = false;
             PeriodicProgressReporter? progressReporter = null;
             if (progress is not null)
                 progressReporter = new(0.5, progress);
@@ -613,62 +664,73 @@ namespace LostArkPatcher
             SqliteCommand dbCommand = dbConnection.CreateCommand();
             await using (dbCommand.ConfigureAwait(false))
             {
-                //Update size in all entries
-                progressReporter?.SetStageTarget(0, 0.05f);
+                progressReporter?.StartNextStage(0.05f); //0~5%
+                //Get size and last modified time for all entries
                 await pending_changes.DeleteAsync().ConfigureAwait(false);
-                string sqlAllSizes = SQL.Row.Select(
+                string sqlAll = SQL.Row.Select(
                     file_version.name,
                     null,
-                    "unique_path, size"
+                    "unique_path"
                 );
-                dbCommand.CommandText = SQL.Row.CountQuery(sqlAllSizes);
+                dbCommand.CommandText = SQL.Row.CountQuery(sqlAll);
                 totalCount = Convert.ToInt32(await dbCommand.ExecuteScalarAsync().ConfigureAwait(false));
                 doneCount = 0;
                 await using (SqliteTransaction transaction = dbConnection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
                     dbCommand.Transaction = transaction;
-                    dbCommand.CommandText = sqlAllSizes;
-                    DbDataReader reader_size = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
-                    SqliteCommand dbCommand_size = new(
+
+                    dbCommand.CommandText = sqlAll;
+                    DbDataReader reader = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
+                    SqliteCommand dbCommand_size_lastModified = new(
                         SQL.Row.Replace(
                             pending_changes.name,
-                            "unique_path, size",
-                            "@unique_path, @size"
+                            "unique_path, size, last_modified",
+                            "@unique_path, @size, @last_modified"
                         ),
-                        dbConnection
+                        dbConnection,
+                        transaction
                     );
-                    await using (reader_size.ConfigureAwait(false))
-                    await using (dbCommand_size.ConfigureAwait(false))
+                    await using (reader.ConfigureAwait(false))
+                    await using (dbCommand_size_lastModified.ConfigureAwait(false))
                     {
-                        dbCommand_size.Transaction = transaction;
-                        foreach (IDataRecord row in reader_size)
+                        foreach (IDataRecord row in reader)
                         {
                             if (cancelToken.IsCancellationRequested)
                                 break;
 
                             string unique_path = Convert.ToString(row["unique_path"]);
-                            object _size = row["size"];
-                            int? size = _size == DBNull.Value ? null : Convert.ToInt32(_size);
-
-                            long diskSize = GetFileSize(unique_path);
-                            if (size != diskSize)
+                            FileInfo? fileInfo = GetFileInfo(unique_path);
+                            if (fileInfo is null) //skip when file cannot be accessed
                             {
-                                dbCommand_size.Parameters.AddWithValue("@unique_path", unique_path);
-                                dbCommand_size.Parameters.AddWithValue("@size", diskSize < 0 ? DBNull.Value : diskSize);
-                                await dbCommand_size.ExecuteNonQueryAsync().ConfigureAwait(false);
-                                dbCommand_size.Parameters.Clear();
+                                someAccessesDenied = true;
+                                continue;
                             }
-                            progressReporter?.SetStageRatio((float)++doneCount / totalCount);
+
+                            dbCommand_size_lastModified.Parameters.AddWithValue("@unique_path", unique_path);
+                            dbCommand_size_lastModified.Parameters.AddWithValue("@size", !fileInfo.Exists ? DBNull.Value : fileInfo.Length);
+                            if (hashAfter is null)
+                                dbCommand_size_lastModified.Parameters.AddWithValue("@last_modified", DBNull.Value);
+                            else
+                                dbCommand_size_lastModified.Parameters.AddWithValue("@last_modified", !fileInfo.Exists ? DBNull.Value : (int)(fileInfo.LastWriteTimeUtc - DateTime.UnixEpoch).TotalSeconds);
+                            await dbCommand_size_lastModified.ExecuteNonQueryAsync().ConfigureAwait(false);
+                            dbCommand_size_lastModified.Parameters.Clear();
+                            if (progressReporter is not null)
+                                progressReporter.StageRatio = (float)++doneCount / totalCount;
                         }
                     }
+
                     transaction.Commit();
                     dbCommand.Transaction = null;
                 }
+
                 if (cancelToken.IsCancellationRequested)
                 {
                     await pending_changes.DeleteAsync().ConfigureAwait(false);
-                    return (0, 0);
+                    return (0, 0, someAccessesDenied);
                 }
+
+                progressReporter?.StartNextStage(0.01f); //5~6%
+                //Write sizes back
                 dbCommand.CommandText = SQL.Row.ReplaceQuery(
                     file_version.name,
                     "unique_path, version, size, hash, property",
@@ -682,41 +744,37 @@ namespace LostArkPatcher
                 );
                 await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
                 //Delete entries with missing files
-                await file_version.DeleteAsync("size is null").ConfigureAwait(false);
-
-                if (noGuessing)
-                {
-                    progressReporter?.SetStageTarget(0.05f, 0.05f);
+                deleted += await file_version.DeleteAsync("size is null").ConfigureAwait(false);
+                await pending_changes.DeleteAsync($"size is null").ConfigureAwait(false);
+                //Keep only entries to be hashed in 'pending_changes'
+                if (hashAfter is not null)
+                    await pending_changes.DeleteAsync($"last_modified < {(int)((DateTime)hashAfter - DateTime.UnixEpoch).TotalSeconds}").ConfigureAwait(false);
+                else if(canGuess)
                     await pending_changes.DeleteAsync().ConfigureAwait(false);
 
-                    //Delete entries that don't match any size in server db
-                    string sqlServerHasNoSize = SQL.Row.LeftJoin(
-                        file_version.name,
-                        fileInfo.name,
-                        "left.unique_path = right.unique_path and left.size = right.size",
-                        "right.unique_path is null",
-                        "distinct left.unique_path"
-                    );
-                    dbCommand.CommandText = SQL.Row.DeleteInQuery(
-                        file_version.name,
-                        "unique_path",
-                        sqlServerHasNoSize
-                    );
-                    await dbCommand.ExecuteNonQueryAsync();
-                    //Calculate file hash for the rest
-                    dbCommand.CommandText = SQL.Row.ReplaceQuery(
-                        pending_changes.name,
-                        "unique_path",
-                        SQL.Row.Select(
-                            file_version.name,
-                            null,
-                            "unique_path"
-                        )
-                    );
-                    await dbCommand.ExecuteNonQueryAsync();
-                    progressReporter?.SetStageTarget(0.1f, 0.85f);
-                }
-                else
+                progressReporter?.StartNextStage(0.01f); //6~7%
+                //Delete entries that don't match any size in server db
+                string sqlServerHasNoSize = SQL.Row.LeftJoin(
+                    file_version.name,
+                    fileInfo.name,
+                    "left.unique_path = right.unique_path and left.size = right.size",
+                    "right.unique_path is null",
+                    "distinct left.unique_path"
+                );
+                dbCommand.CommandText = SQL.Row.DeleteInQuery(
+                    file_version.name,
+                    "unique_path",
+                    sqlServerHasNoSize
+                );
+                deleted += await dbCommand.ExecuteNonQueryAsync();
+                dbCommand.CommandText = SQL.Row.DeleteInQuery(
+                    pending_changes.name,
+                    "unique_path",
+                    sqlServerHasNoSize
+                );
+                await dbCommand.ExecuteNonQueryAsync();
+
+                if (canGuess)
                 {
                     /*
                     size matched, version/hash in the same entry matched in server db:
@@ -733,8 +791,6 @@ namespace LostArkPatcher
                     hash matched in server db: fill in the version
                     no such hash in server db: delete entry
                     */
-                    progressReporter?.SetStageTarget(0.05f, 0.01f);
-                    await pending_changes.DeleteAsync().ConfigureAwait(false);
 
                     string sqlServerHasVersion = SQL.Row.Join(
                         file_version.name,
@@ -789,6 +845,7 @@ namespace LostArkPatcher
                         await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
                     }
 
+                    progressReporter?.StartNextStage(0.01f); //7~8%
                     //T/F and no _/T: version correct and hash wrong, replace the wrong hash (only one hash for one version)
                     string sqlServerHasOnlyVersionAndHasNoHash = SQL.Row.SelectInQueryButInQuery(
                         "unique_path",
@@ -815,9 +872,9 @@ namespace LostArkPatcher
                             )
                         );
                         await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                        progressReporter?.SetStageTarget(0.06f, 0.01f);
                     }
 
+                    progressReporter?.StartNextStage(0.01f); //8~9%
                     //F/T and no T/_: hash correct and version wrong, fill in the max version (there may be multiple versions with the same hash)
                     string sqlServerHasOnlyHashAndHasNoVersion = SQL.Row.SelectInQueryButInQuery(
                         "unique_path",
@@ -851,7 +908,6 @@ namespace LostArkPatcher
                             )
                         );
                         await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                        progressReporter?.SetStageTarget(0.07f, 0.01f);
                     }
 
                     //only size matched, number of entries:
@@ -864,6 +920,7 @@ namespace LostArkPatcher
                         )
                     );
 
+                    progressReporter?.StartNextStage(0.01f); //9~10%
                     //1: fill in the version and hash
                     string sqlServerHasNoVersionAndHasNoHashAndHasOneSize = SQL.Row.SelectQuery(
                         SQL.Row.GroupQuery(
@@ -903,7 +960,6 @@ namespace LostArkPatcher
                             )
                         );
                         await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                        progressReporter?.SetStageTarget(0.08f, 0.02f);
                     }
 
                     //2+: ambiguous, calculate the file hash
@@ -934,32 +990,15 @@ namespace LostArkPatcher
                         );
                         await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
                     }
-
-                    //no size matched: delete entry
-                    string sqlServerHasNoVersionAndHasNoHashAndHasNoSize = SQL.Row.SelectInQueryButInQuery(
-                        "unique_path",
-                        sqlServerHasNoVersionAndHasNoHash,
-                        SQL.Row.Union(
-                            sqlServerHasNoVersionAndHasNoHashAndHasOneSize,
-                            sqlServerHasNoVersionAndHasNoHashAndHasManySize
-                        )
-                    );
-                    if (!cancelToken.IsCancellationRequested)
-                    {
-                        dbCommand.CommandText = SQL.Row.DeleteInQuery(
-                            file_version.name,
-                            "unique_path",
-                            sqlServerHasNoVersionAndHasNoHashAndHasNoSize
-                        );
-                        deleted += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                        progressReporter?.SetStageTarget(0.1f, 0.85f);
-                    }
                 }
+                else
+                    progressReporter?.StartNextStage(0.03f); //7~10%
 
-                //here: every row in 'pending_changes' has
-                //1. all columns not null (for simple update)
-                //2. only 'unique_path' not null (for hashing)
+                //here, every row in 'pending_changes' has
+                //1. all columns (except 'last_modified') not null (for simple update)
+                //2. 'hash' null (for hashing)
 
+                progressReporter?.StartNextStage(0.85f); //10~95%
                 //Calculate the file hash:
                 uint hashingCount = 0;
                 ConcurrentExclusiveSchedulerPair schedulerPair = new(TaskScheduler.Default);
@@ -973,6 +1012,7 @@ namespace LostArkPatcher
                 await using (SqliteTransaction transaction = dbConnection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
                     dbCommand.Transaction = transaction;
+
                     dbCommand.CommandText = sqlAllPending;
                     DbDataReader reader_hash = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
                     SqliteCommand dbCommand_hash = new(
@@ -981,12 +1021,12 @@ namespace LostArkPatcher
                             "unique_path, hash",
                             "@unique_path, @hash"
                         ),
-                        dbConnection
+                        dbConnection,
+                        transaction
                     );
                     await using (reader_hash.ConfigureAwait(false))
                     await using (dbCommand_hash.ConfigureAwait(false))
                     {
-                        dbCommand_hash.Transaction = transaction;
                         foreach (IDataRecord row in reader_hash)
                         {
                             if (cancelToken.IsCancellationRequested)
@@ -1007,10 +1047,13 @@ namespace LostArkPatcher
                                         await dbCommand_hash.ExecuteNonQueryAsync().ConfigureAwait(false);
                                         dbCommand_hash.Parameters.Clear();
                                     }
+                                    else
+                                        someAccessesDenied = true;
                                 }
                                 finally
                                 {
-                                    progressReporter?.SetStageRatio((float)Interlocked.Increment(ref doneCount) / totalCount);
+                                    if (progressReporter is not null)
+                                        progressReporter.StageRatio = (float)Interlocked.Increment(ref doneCount) / totalCount;
                                     Interlocked.Decrement(ref hashingCount);
                                 }
                             }, schedulerPair.ExclusiveScheduler);
@@ -1020,16 +1063,17 @@ namespace LostArkPatcher
 
                     while (hashingCount > 0)
                         await Task.Delay(500).ConfigureAwait(false);
+
                     transaction.Commit();
                     dbCommand.Transaction = null;
                 }
-                progressReporter?.SetStageTarget(0.95f, 0.02f);
 
-                //here: every row in 'pending_changes' has
-                //1. all columns not null (for simple update)
-                //2. only 'unique_path' not null (from canceled hashing)
-                //3. exactly 'unique_path' and 'hash' not null (from finished hashing)
+                //here, every row in 'pending_changes' has
+                //1. all columns (except 'last_modified') not null (for simple update)
+                //2. 'hash' null (from canceled or failed hashing)
+                //3. only 'unique_path' and 'hash' not null (from finished hashing)
 
+                progressReporter?.StartNextStage(0.02f); //95~97%
                 //hash matched in server db: fill in the rest
                 dbCommand.CommandText = SQL.Row.ReplaceQuery(
                     pending_changes.name,
@@ -1046,8 +1090,13 @@ namespace LostArkPatcher
                     )
                 );
                 await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                progressReporter?.SetStageTarget(0.97f, 0.01f);
 
+                //here, every row in 'pending_changes' has
+                //1. all columns (except 'last_modified') not null (for simple update and matched hash)
+                //2. 'hash' null (from canceled or failed hashing)
+                //3. only 'unique_path' and 'hash' not null (for unmatched hash)
+
+                progressReporter?.StartNextStage(0.01f); //97~98%
                 //no such hash in server db: delete entry
                 dbCommand.CommandText = SQL.Row.DeleteInQuery(
                     file_version.name,
@@ -1058,9 +1107,8 @@ namespace LostArkPatcher
                     )
                 );
                 deleted += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                await pending_changes.DeleteAsync("version is null").ConfigureAwait(false);
-                progressReporter?.SetStageTarget(0.98f, 0.02f);
 
+                progressReporter?.StartNextStage(0.02f); //98~100%
                 //Write back fill-ins
                 dbCommand.CommandText = SQL.Row.ReplaceQuery(
                     file_version.name,
@@ -1080,11 +1128,12 @@ namespace LostArkPatcher
                     )
                 );
                 modified += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+                progressReporter?.StartNextStage(0); //100%
                 await pending_changes.DeleteAsync().ConfigureAwait(false);
-                progressReporter?.SetStageTarget(1f, 0f);
             }
             progressReporter?.Dispose();
-            return (deleted, modified);
+            return (deleted, modified, someAccessesDenied);
         }
     }
 }

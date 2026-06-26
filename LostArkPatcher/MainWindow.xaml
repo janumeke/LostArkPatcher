@@ -53,7 +53,10 @@
             </Grid>
             <Popup PopupAnimation="Scroll" IsOpen="{Binding RepairPopupOpen, Mode=TwoWay}" StaysOpen="False"
                 PlacementTarget="{Binding ElementName=RepairButton}" Placement="Bottom">
-                <Button Width="175" Height="35" FontSize="16" Content="進階修復" Command="{Binding RepairOrCancelAsync}" CommandParameter="{x:Static local:MainViewModel+OperationMode.Full}"/>
+                <StackPanel>
+                    <Button Width="175" Height="35" FontSize="16" Content="版本修復" Command="{Binding RepairOrCancelAsync}" CommandParameter="{x:Static local:MainViewModel+OperationMode.Last}"/>
+                    <Button Width="175" Height="35" FontSize="16" Content="完整修復" Command="{Binding RepairOrCancelAsync}" CommandParameter="{x:Static local:MainViewModel+OperationMode.Full}"/>
+                </StackPanel>
             </Popup>
         </StackPanel>
         <TextBox Margin="0,0,10,5" Width="175" FontSize="15" IsReadOnly="True" TextWrapping="Wrap" Text="{Binding LogView, Mode=OneWay}"/>
