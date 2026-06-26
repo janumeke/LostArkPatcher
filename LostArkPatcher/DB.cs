@@ -593,44 +593,6 @@ namespace LostArkPatcher
             return (updated, failed);
         }
 
-        /// <param name="FileExists">in: relative path, case-insensitive (ok for windows system)</param>
-        /// <exception cref="InvalidOperationException"/>
-        //Entries in local DB but in server DB will be deleted and those in server DB but in local DB will be inserted; entries with missing or corrupted files will be unchanged
-        public async Task<(int deleted, int inserted)> FixFileKeysAsync()
-        {
-            if (fileInfo is null)
-                throw new InvalidOperationException("Server DB is not attched.");
-
-            int deleted = 0, inserted = 0;
-            SqliteCommand dbCommand = dbConnection.CreateCommand();
-            await using (dbCommand.ConfigureAwait(false))
-            {
-                dbCommand.CommandText = SQL.Row.DeleteInQuery(
-                    file_version.name,
-                    "unique_path",
-                    SQL.Row.SelectInButIn(
-                        "unique_path",
-                        file_version.name,
-                        fileInfo.name
-                    )
-                );
-                deleted += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-
-                dbCommand.CommandText = SQL.Row.InsertQuery(
-                    SQL.Row.SelectInButIn(
-                        "unique_path",
-                        fileInfo.name,
-                        file_version.name,
-                        "distinct unique_path"
-                    ),
-                    "unique_path",
-                    file_version.name
-                );
-                inserted += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-            }
-            return (deleted, inserted);
-        }
-
         /// <param name="GetFileInfo">
         /// <para>in: relative path, case-insensitive (ok for windows system)</para>
         /// <para>out: a <c>FileInfo</c> object for the file or <c>null</c> if there is an error</para>
@@ -650,12 +612,12 @@ namespace LostArkPatcher
         /// <exception cref="InvalidOperationException"/>
         //Use actual size, version and hash of entry if possible, and actual hash if necessary to best guess which version in the server db the file is
         //Entries with missing or unknown files will be deleted, but entries with files that can't be accessed are unchanged
-        public async Task<(int deleted, int modified, bool someAccessesDenied)> FixFileInfosAsync(Func<string, FileInfo?> GetFileInfo, Func<string, CancellationToken, Task<string?>> HashFileAsync, CancellationToken cancelToken, IProgress<float>? progress = null, bool canGuess = false, DateTime? hashAfter = null)
+        public async Task<(int modified, bool someAccessesDenied)> FixFileInfosAsync(Func<string, FileInfo?> GetFileInfo, Func<string, CancellationToken, Task<string?>> HashFileAsync, CancellationToken cancelToken, IProgress<float>? progress = null, bool canGuess = false, DateTime? hashAfter = null)
         {
             if (fileInfo is null)
                 throw new InvalidOperationException("Server DB is not attched.");
 
-            int deleted = 0, modified = 0;
+            int modified = 0;
             bool someAccessesDenied = false;
             PeriodicProgressReporter? progressReporter = null;
             if (progress is not null)
@@ -668,9 +630,9 @@ namespace LostArkPatcher
                 //Get size and last modified time for all entries
                 await pending_changes.DeleteAsync().ConfigureAwait(false);
                 string sqlAll = SQL.Row.Select(
-                    file_version.name,
+                    fileInfo.name,
                     null,
-                    "unique_path"
+                    "distinct unique_path"
                 );
                 dbCommand.CommandText = SQL.Row.CountQuery(sqlAll);
                 totalCount = Convert.ToInt32(await dbCommand.ExecuteScalarAsync().ConfigureAwait(false));
@@ -708,10 +670,7 @@ namespace LostArkPatcher
 
                             dbCommand_size_lastModified.Parameters.AddWithValue("@unique_path", unique_path);
                             dbCommand_size_lastModified.Parameters.AddWithValue("@size", !fileInfo.Exists ? DBNull.Value : fileInfo.Length);
-                            if (hashAfter is null)
-                                dbCommand_size_lastModified.Parameters.AddWithValue("@last_modified", DBNull.Value);
-                            else
-                                dbCommand_size_lastModified.Parameters.AddWithValue("@last_modified", !fileInfo.Exists ? DBNull.Value : (int)(fileInfo.LastWriteTimeUtc - DateTime.UnixEpoch).TotalSeconds);
+                            dbCommand_size_lastModified.Parameters.AddWithValue("@last_modified", !fileInfo.Exists ? DBNull.Value : (int)(fileInfo.LastWriteTimeUtc - DateTime.UnixEpoch).TotalSeconds);
                             await dbCommand_size_lastModified.ExecuteNonQueryAsync().ConfigureAwait(false);
                             dbCommand_size_lastModified.Parameters.Clear();
                             if (progressReporter is not null)
@@ -726,47 +685,22 @@ namespace LostArkPatcher
                 if (cancelToken.IsCancellationRequested)
                 {
                     await pending_changes.DeleteAsync().ConfigureAwait(false);
-                    return (0, 0, someAccessesDenied);
+                    return (0, someAccessesDenied);
                 }
 
                 progressReporter?.StartNextStage(0.01f); //5~6%
-                //Write sizes back
-                dbCommand.CommandText = SQL.Row.ReplaceQuery(
-                    file_version.name,
-                    "unique_path, version, size, hash, property",
-                    SQL.Row.Join(
-                        pending_changes.name,
-                        file_version.name,
-                        "left.unique_path = right.unique_path",
-                        null,
-                        "right.unique_path, right.version, left.size, right.hash, right.property"
-                    )
-                );
-                await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
                 //Delete entries with missing files
-                deleted += await file_version.DeleteAsync("size is null").ConfigureAwait(false);
                 await pending_changes.DeleteAsync($"size is null").ConfigureAwait(false);
-                //Keep only entries to be hashed in 'pending_changes'
-                if (hashAfter is not null)
-                    await pending_changes.DeleteAsync($"last_modified < {(int)((DateTime)hashAfter - DateTime.UnixEpoch).TotalSeconds}").ConfigureAwait(false);
-                else if(canGuess)
-                    await pending_changes.DeleteAsync().ConfigureAwait(false);
 
                 progressReporter?.StartNextStage(0.01f); //6~7%
                 //Delete entries that don't match any size in server db
                 string sqlServerHasNoSize = SQL.Row.LeftJoin(
-                    file_version.name,
+                    pending_changes.name,
                     fileInfo.name,
                     "left.unique_path = right.unique_path and left.size = right.size",
                     "right.unique_path is null",
                     "distinct left.unique_path"
                 );
-                dbCommand.CommandText = SQL.Row.DeleteInQuery(
-                    file_version.name,
-                    "unique_path",
-                    sqlServerHasNoSize
-                );
-                deleted += await dbCommand.ExecuteNonQueryAsync();
                 dbCommand.CommandText = SQL.Row.DeleteInQuery(
                     pending_changes.name,
                     "unique_path",
@@ -776,6 +710,20 @@ namespace LostArkPatcher
 
                 if (canGuess)
                 {
+                    //copy version, hash and property over
+                    dbCommand.CommandText = SQL.Row.ReplaceQuery(
+                        pending_changes.name,
+                        "unique_path, version, size, hash, property, last_modified",
+                        SQL.Row.Join(
+                            pending_changes.name,
+                            file_version.name,
+                            "left.unique_path = right.unique_path",
+                            null,
+                            "left.unique_path, right.version, left.size, right.hash, right.property, left.last_modified"
+                        )
+                    );
+                    await dbCommand.ExecuteNonQueryAsync();
+
                     /*
                     size matched, version/hash in the same entry matched in server db:
                     T/T: both correct, unchanged
@@ -793,7 +741,7 @@ namespace LostArkPatcher
                     */
 
                     string sqlServerHasVersion = SQL.Row.Join(
-                        file_version.name,
+                        pending_changes.name,
                         fileInfo.name,
                         @"left.unique_path = right.unique_path and left.size = right.size
                             and left.version = right.version",
@@ -801,7 +749,7 @@ namespace LostArkPatcher
                         "distinct left.unique_path"
                     );
                     string sqlServerHasHash = SQL.Row.Join(
-                        file_version.name,
+                        pending_changes.name,
                         fileInfo.name,
                         @"left.unique_path = right.unique_path and left.size = right.size
                             and left.hash = right.hash",
@@ -809,7 +757,7 @@ namespace LostArkPatcher
                         "distinct left.unique_path"
                     );
                     string sqlServerHasOnlyVersion = SQL.Row.Join(
-                        file_version.name,
+                        pending_changes.name,
                         fileInfo.name,
                         @"left.unique_path = right.unique_path and left.size = right.size
                             and left.version = right.version and (left.hash is null or left.hash <> right.hash)",
@@ -817,7 +765,7 @@ namespace LostArkPatcher
                         "distinct left.unique_path"
                     );
                     string sqlServerHasOnlyHash = SQL.Row.Join(
-                        file_version.name,
+                        pending_changes.name,
                         fileInfo.name,
                         @"left.unique_path = right.unique_path and left.size = right.size
                             and (left.version is null or left.version <> right.version) and left.hash = right.hash",
@@ -837,10 +785,11 @@ namespace LostArkPatcher
                     );
                     if (!cancelToken.IsCancellationRequested)
                     {
-                        dbCommand.CommandText = SQL.Row.ReplaceQuery(
+                        dbCommand.CommandText = SQL.Row.UpdateInQuery(
                             pending_changes.name,
                             "unique_path",
-                            sqlServerHasOnlyVersionAndHasOnlyHash
+                            sqlServerHasOnlyVersionAndHasOnlyHash,
+                            "hash = NULL"
                         );
                         await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
                     }
@@ -856,19 +805,19 @@ namespace LostArkPatcher
                     {
                         dbCommand.CommandText = SQL.Row.ReplaceQuery(
                             pending_changes.name,
-                            "unique_path, version, size, hash, property",
+                            "unique_path, version, size, hash, property, last_modified",
                             SQL.Row.JoinQuery(
                                 fileInfo.name,
                                 SQL.Row.JoinQuery(
-                                    file_version.name,
+                                    pending_changes.name,
                                     sqlServerHasOnlyVersionAndHasNoHash,
                                     "left.unique_path = right.unique_path",
                                     null,
-                                    "left.unique_path, left.version"
+                                    "left.unique_path, left.version, left.last_modified"
                                 ),
                                 "left.unique_path = right.unique_path and left.version = right.version",
                                 null,
-                                "right.unique_path, right.version, left.size, left.hash, left.property"
+                                "right.unique_path, right.version, left.size, left.hash, left.property, right.last_modified"
                             )
                         );
                         await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
@@ -885,21 +834,21 @@ namespace LostArkPatcher
                     {
                         dbCommand.CommandText = SQL.Row.ReplaceQuery(
                             pending_changes.name,
-                            "unique_path, version, size, hash, property",
+                            "unique_path, version, size, hash, property, last_modified",
                             SQL.Row.GroupQuery(
                                 SQL.Row.OrderQuery(
                                     SQL.Row.JoinQuery(
                                         fileInfo.name,
                                         SQL.Row.JoinQuery(
-                                            file_version.name,
+                                            pending_changes.name,
                                             sqlServerHasOnlyHashAndHasNoVersion,
                                             "left.unique_path = right.unique_path",
                                             null,
-                                            "left.unique_path, left.hash"
+                                            "left.unique_path, left.hash, left.last_modified"
                                         ),
                                         "left.unique_path = right.unique_path and left.hash = right.hash",
                                         null,
-                                        "right.unique_path, left.version, left.size, right.hash, left.property"
+                                        "right.unique_path, left.version, left.size, right.hash, left.property, right.last_modified"
                                     ),
                                     "version",
                                     SQL.OrderDirection.Descending
@@ -913,7 +862,7 @@ namespace LostArkPatcher
                     //only size matched, number of entries:
                     string sqlServerHasNoVersionAndHasNoHash = SQL.Row.SelectInButInQuery(
                         "unique_path",
-                        file_version.name,
+                        pending_changes.name,
                         SQL.Row.Union(
                             sqlServerHasVersion,
                             sqlServerHasHash
@@ -927,7 +876,7 @@ namespace LostArkPatcher
                             SQL.Row.JoinQuery(
                                 fileInfo.name,
                                 SQL.Row.JoinQuery(
-                                    file_version.name,
+                                    pending_changes.name,
                                     sqlServerHasNoVersionAndHasNoHash,
                                     "left.unique_path = right.unique_path",
                                     null,
@@ -944,19 +893,19 @@ namespace LostArkPatcher
                     {
                         dbCommand.CommandText = SQL.Row.ReplaceQuery(
                             pending_changes.name,
-                            "unique_path, version, size, hash, property",
+                            "unique_path, version, size, hash, property, last_modified",
                             SQL.Row.JoinQuery(
                                 fileInfo.name,
                                 SQL.Row.JoinQuery(
-                                    file_version.name,
+                                    pending_changes.name,
                                     sqlServerHasNoVersionAndHasNoHashAndHasOneSize,
                                     "left.unique_path = right.unique_path",
                                     null,
-                                    "left.unique_path, left.size"
+                                    "left.unique_path, left.size, left.last_modified"
                                 ),
                                 "left.unique_path = right.unique_path and left.size = right.size",
                                 null,
-                                "right.unique_path, left.version, right.size, left.hash, left.property"
+                                "right.unique_path, left.version, right.size, left.hash, left.property, right.last_modified"
                             )
                         );
                         await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
@@ -968,7 +917,7 @@ namespace LostArkPatcher
                             SQL.Row.JoinQuery(
                                 fileInfo.name,
                                 SQL.Row.JoinQuery(
-                                    file_version.name,
+                                    pending_changes.name,
                                     sqlServerHasNoVersionAndHasNoHash,
                                     "left.unique_path = right.unique_path",
                                     null,
@@ -983,37 +932,50 @@ namespace LostArkPatcher
                     );
                     if (!cancelToken.IsCancellationRequested)
                     {
-                        dbCommand.CommandText = SQL.Row.ReplaceQuery(
+                        dbCommand.CommandText = SQL.Row.UpdateInQuery(
                             pending_changes.name,
                             "unique_path",
-                            sqlServerHasNoVersionAndHasNoHashAndHasManySize
+                            sqlServerHasNoVersionAndHasNoHashAndHasManySize,
+                            "hash = NULL"
                         );
                         await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
                     }
                 }
                 else
+                {
                     progressReporter?.StartNextStage(0.03f); //7~10%
+                    //Keep only entries to be hashed
+                    if (hashAfter is not null)
+                        await pending_changes.DeleteAsync($"last_modified < {(int)((DateTime)hashAfter - DateTime.UnixEpoch).TotalSeconds}").ConfigureAwait(false);
+                }
 
                 //here, every row in 'pending_changes' has
-                //1. all columns (except 'last_modified') not null (for simple update)
+                //1. all columns not null (for simple update)
                 //2. 'hash' null (for hashing)
 
                 progressReporter?.StartNextStage(0.85f); //10~95%
                 //Calculate the file hash:
                 uint hashingCount = 0;
                 ConcurrentExclusiveSchedulerPair schedulerPair = new(TaskScheduler.Default);
-                string sqlAllPending = SQL.Row.Select(
-                    pending_changes.name,
-                    "hash is null"
-                );
-                dbCommand.CommandText = SQL.Row.CountQuery(sqlAllPending);
+                string sqlAllToHash;
+                if (hashAfter is null)
+                    sqlAllToHash = SQL.Row.Select(
+                        pending_changes.name,
+                        $"hash is null"
+                    );
+                else
+                    sqlAllToHash = SQL.Row.Select(
+                        pending_changes.name,
+                        $"hash is null or last_modified >= {(int)((DateTime)hashAfter - DateTime.UnixEpoch).TotalSeconds}" //always hash last modified later than hashAfter
+                    );
+                dbCommand.CommandText = SQL.Row.CountQuery(sqlAllToHash);
                 totalCount = Convert.ToInt32(await dbCommand.ExecuteScalarAsync().ConfigureAwait(false));
                 doneCount = 0;
                 await using (SqliteTransaction transaction = dbConnection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
                     dbCommand.Transaction = transaction;
 
-                    dbCommand.CommandText = sqlAllPending;
+                    dbCommand.CommandText = sqlAllToHash;
                     DbDataReader reader_hash = await dbCommand.ExecuteReaderAsync().ConfigureAwait(false);
                     SqliteCommand dbCommand_hash = new(
                         SQL.Row.Replace(
@@ -1053,14 +1015,13 @@ namespace LostArkPatcher
                                 finally
                                 {
                                     if (progressReporter is not null)
-                                        progressReporter.StageRatio = (float)Interlocked.Increment(ref doneCount) / totalCount;
+                                        progressReporter.StageRatio = (float)++doneCount / totalCount;
                                     Interlocked.Decrement(ref hashingCount);
                                 }
                             }, schedulerPair.ExclusiveScheduler);
 #pragma warning restore CS4014
                         }
                     }
-
                     while (hashingCount > 0)
                         await Task.Delay(500).ConfigureAwait(false);
 
@@ -1069,7 +1030,7 @@ namespace LostArkPatcher
                 }
 
                 //here, every row in 'pending_changes' has
-                //1. all columns (except 'last_modified') not null (for simple update)
+                //1. all columns not null (for simple update)
                 //2. 'hash' null (from canceled or failed hashing)
                 //3. only 'unique_path' and 'hash' not null (from finished hashing)
 
@@ -1099,22 +1060,35 @@ namespace LostArkPatcher
                 progressReporter?.StartNextStage(0.01f); //97~98%
                 //no such hash in server db: delete entry
                 dbCommand.CommandText = SQL.Row.DeleteInQuery(
-                    file_version.name,
+                    pending_changes.name,
                     "unique_path",
                     SQL.Row.Select(
                         pending_changes.name,
-                        "hash is not null and (version is null or size is null or property is null)"
+                        "hash is not null and (version is null or size is null or property is null)",
+                        "unique_path"
                     )
                 );
-                deleted += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+                await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
 
-                progressReporter?.StartNextStage(0.02f); //98~100%
-                //Write back fill-ins
+                progressReporter?.StartNextStage(0.01f); //98~99%
+                //Write back deletions
+                dbCommand.CommandText = SQL.Row.DeleteInQuery(
+                    file_version.name,
+                    "unique_path",
+                    SQL.Row.SelectInButIn(
+                        "unique_path",
+                        file_version.name,
+                        pending_changes.name
+                    )
+                );
+                modified += await dbCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+                progressReporter?.StartNextStage(0.01f); //99~100%
+                //Write back modifications
                 dbCommand.CommandText = SQL.Row.ReplaceQuery(
                     file_version.name,
                     "unique_path, version, size, hash, property",
-                    //only rows with any column changed,
-                    //because in full mode, files with a correct row will still be hashed
+                    //only rows with any column changed
                     SQL.Row.QueryLeftJoin(
                         SQL.Row.Select(
                             pending_changes.name,
@@ -1133,7 +1107,7 @@ namespace LostArkPatcher
                 await pending_changes.DeleteAsync().ConfigureAwait(false);
             }
             progressReporter?.Dispose();
-            return (deleted, modified, someAccessesDenied);
+            return (modified, someAccessesDenied);
         }
     }
 }

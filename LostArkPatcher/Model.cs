@@ -330,7 +330,7 @@ namespace LostArkPatcher
         }
 
         /// <remarks>Thread-unsafe.</remarks>
-        public static async Task<(int deleted, int modified, bool someAccessesDenied)> RepairGameFileEntriesAsync(string gamePath, string serverDBPath, RepairMode mode, CancellationToken cancelToken, IProgress<float>? progress = null)
+        public static async Task<(int modified, bool someAccessesDenied)> RepairGameFileEntriesAsync(string gamePath, string serverDBPath, RepairMode mode, CancellationToken cancelToken, IProgress<float>? progress = null)
         {
             await using DB db = new(gamePath + LOCALDB_FILENAME, serverDBPath);
             Model.gamePath = gamePath;
@@ -348,13 +348,13 @@ namespace LostArkPatcher
                 }
             }
             //SQLite doesn't support asynchronous operations
-            (int deleted, int modified, bool someAccessesDenied) = await Task.Run(() => db.FixFileInfosAsync((relativePath) => {
+            (int modified, bool someAccessesDenied) = await Task.Run(() => db.FixFileInfosAsync((relativePath) => {
                 try { return new FileInfo(gamePath + relativePath); }
                 catch { return null; }
             }, HashFileAsync, cancelToken, progress, mode != RepairMode.Full, hashAfter));
             //SQLite doesn't support asynchronous operations
             await Task.Run(() => db.FixVersionAsync());
-            return (deleted, modified, someAccessesDenied);
+            return (modified, someAccessesDenied);
         }
         #endregion
 

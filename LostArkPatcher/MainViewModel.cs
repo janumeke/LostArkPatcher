@@ -648,10 +648,7 @@ namespace LostArkPatcher
                 Log.AddLine(stageLine);
                 try
                 {
-                    int deleted, inserted, modified;
-                    bool someAccessesDenied;
-
-                    await using (DB db = new(GameDirectory + Model.LOCALDB_FILENAME, Model.CachedServerDBPath))
+                    await using (DB db = new(GameDirectory + Model.LOCALDB_FILENAME))
                     {
                         lastLine = new LogLinePending("├檢查結構");
                         Log.AddLine(lastLine);
@@ -666,18 +663,6 @@ namespace LostArkPatcher
                             await Task.Run(() => db.FixSchemaAsync());
                             lastLine.Status = LogLineState.Finished;
                         }
-
-                        if (cancellationTokenSource.IsCancellationRequested)
-                        {
-                            Log.AddLine(new LogLine("已中斷"));
-                            return;
-                        }
-
-                        lastLine = new LogLinePending("├檢查項目");
-                        Log.AddLine(lastLine);
-                        //SQLite doesn't support asynchronous operations
-                        (deleted, inserted) = await Task.Run(() => db.FixFileKeysAsync());
-                        lastLine.Status = LogLineState.Finished;
                     }
 
                     if (cancellationTokenSource.IsCancellationRequested)
@@ -688,15 +673,15 @@ namespace LostArkPatcher
 
                     lastLine = new LogLineProgress("└檢查資料");
                     Log.AddLine(lastLine);
-                    (deleted, modified, someAccessesDenied) = await Model.RepairGameFileEntriesAsync(GameDirectory, Model.CachedServerDBPath, CovertToModelRepairMode(mode), cancellationTokenSource.Token, new Progress<float>((ratio) => {
+                    (int modified, bool someAccessesDenied) = await Model.RepairGameFileEntriesAsync(GameDirectory, Model.CachedServerDBPath, CovertToModelRepairMode(mode), cancellationTokenSource.Token, new Progress<float>((ratio) => {
                         ((LogLineProgress)lastLine).Percent = ratio * 100;
                     }));
                     if (cancellationTokenSource.IsCancellationRequested)
                         lastLine.Status = LogLineState.Interrupted;
                     else
                         lastLine.Status = LogLineState.Finished;
-                    if (deleted + modified > 0)
-                        Log.AddLine(new LogLine($"    已修復：{deleted + modified}"));
+                    if (modified > 0)
+                        Log.AddLine(new LogLine($"    已修復：{modified}"));
                     if (someAccessesDenied)
                         Log.AddLine(new LogLine($"    警告：已略過無法存取的檔案"));
                     GameCurrentVersion = await Model.GetGameCurrentVersionAsync(GameDirectory);
